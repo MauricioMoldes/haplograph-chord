@@ -1,0 +1,1525 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HaploGraph cross-chromosome map</title>
+<!--
+  HaploGraph cross-chromosome chord diagram (self-contained; embed with an <iframe>).
+  Data: https://haplograph.haploblocks.org/data/chrpair_by_band.tsv  (hard-coded in CFG.data; from aggregate_edges.sh; columns chrom_a chrom_b lift_band n_edges mean_weight)
+  Options (query string): ?theme=dark  ?data=path/to/chrpair_by_band.tsv  ?bands=2-3,3-5  ?scale=sqrt
+  Config below. Exports (SVG/PNG) are always rendered on white for papers and reports.
+-->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<style>
+  :root { --bg:#ffffff; --ink:#1f2a37; --muted:#6b7280; --line:#e6eaf0; --soft:#f4f7fb; --accent:#2563a6; }
+  :root[data-theme="dark"] { --bg:#0b0f14; --ink:#e5e9f0; --muted:#9aa5b4; --line:#1e2733; --soft:#111823; --accent:#7fb2e5; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:1100px; margin:0 auto; padding:16px; }
+  h1 { font-size:18px; font-weight:600; margin:0 0 2px; }
+  .sub { color:var(--muted); margin:0 0 12px; }
+  .controls { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; padding:10px 12px; background:var(--soft); border-radius:10px; margin-bottom:12px; }
+  .controls .grp { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .controls .lbl { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; margin-right:2px; }
+  label.chip { display:inline-flex; gap:5px; align-items:center; padding:3px 9px; border:1px solid var(--line); border-radius:999px; cursor:pointer; background:var(--bg); user-select:none; }
+  label.chip input { accent-color:var(--accent); margin:0; }
+  select, button { font:inherit; color:var(--ink); background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:4px 10px; cursor:pointer; }
+  button:hover, select:hover { border-color:var(--accent); }
+  .main { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:16px; align-items:start; }
+  @media (max-width: 820px) { .main { grid-template-columns:1fr; } }
+  #chart { position:relative; }
+  svg { width:100%; height:auto; display:block; }
+  #tip { position:absolute; pointer-events:none; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; box-shadow:0 4px 14px rgba(0,0,0,.12); font-size:12.5px; display:none; max-width:260px; z-index:5; }
+  #tip b { font-weight:600; }
+  .panel { background:var(--soft); border-radius:10px; padding:12px; font-size:13px; }
+  .panel h2 { font-size:13px; margin:0 0 6px; font-weight:600; }
+  .panel table { width:100%; border-collapse:collapse; margin-bottom:10px; }
+  .panel td { padding:2px 0; } .panel td:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+  .muted { color:var(--muted); }
+  #msg { padding:14px; border:1px dashed var(--line); border-radius:10px; display:none; margin-bottom:12px; }
+  .foot { color:var(--muted); font-size:12px; margin-top:10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Cross-chromosome HaploGraph</h1>
+  <p class="sub" id="sub"></p>
+
+  <div id="msg"></div>
+
+  <div class="controls">
+    <div class="grp"><span class="lbl">Lift</span><span id="bands"></span></div>
+    <div class="grp"><label class="chip"><input type="checkbox" id="same" checked> same chromosome</label></div>
+    <div class="grp"><span class="lbl">Width</span>
+      <select id="scale"><option value="linear">linear</option><option value="sqrt">square root</option></select></div>
+    <div class="grp" style="margin-left:auto">
+      <button id="reset">Reset</button>
+      <button id="dlsvg">SVG</button><button id="dlpng">PNG</button><button id="dlcsv">CSV</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div id="chart"><div id="tip"></div><svg id="svg" viewBox="0 0 820 860" role="img" aria-label="Chord diagram of HaploGraph edges between chromosomes"></svg></div>
+    <div class="panel" id="panel"></div>
+  </div>
+  <div class="foot">Each ribbon joins two chromosomes; its width is the number of edges (pairs of haplotype-cluster nodes sharing individuals) that pass the filters. Click a chromosome to focus; click again to release.</div>
+</div>
+
+<script>
+/* ---------- configuration ---------- */
+const CFG = Object.assign({
+  title: "Cross-chromosome HaploGraph",
+  cohort: "1000 Genomes, N = 2,548 individuals",
+  threshold: "lift ≥ 2, weight ≥ 5; clusters with min(support, N − support) ≥ 25",
+  data: "https://haplograph.haploblocks.org/data/chrpair_by_band.tsv",
+  note: ""                                  // e.g. "DEMO DATA" shown on the figure
+}, window.HAPLOGRAPH_CONFIG || {});
+const Q = new URLSearchParams(location.search);
+if (Q.get("theme") === "dark") document.documentElement.setAttribute("data-theme", "dark");
+if (Q.get("data")) CFG.data = Q.get("data");
+if (Q.get("note")) CFG.note = Q.get("note");
+
+const LIGHT = { bg:"#ffffff", ink:"#1f2a37", muted:"#6b7280" };
+const DARK  = { bg:"#0b0f14", ink:"#e5e9f0", muted:"#9aa5b4" };
+const CHRS = d3.range(1, 23).map(i => "chr" + i);
+const COL = i => d3.hcl((i * 360 / 22 + 20) % 360, 42, 66).formatHex();
+const fmt = d3.format(",");
+const compact = n => n >= 1e9 ? (n / 1e9).toFixed(2) + " billion" : n >= 1e6 ? (n / 1e6).toFixed(2) + " M" : fmt(n);
+
+/* ---------- state ---------- */
+let rows = [], bandNames = [], active = new Set(), focus = null;
+let showSame = true, scaleMode = Q.get("scale") === "sqrt" ? "sqrt" : "linear";
+document.getElementById("scale").value = scaleMode;
+
+const bandLo = b => b.startsWith(">=") ? +b.slice(2) : +b.split("-")[0];
+
+function load(text) {
+  const parsed = d3.tsvParse(text.replace(/\r/g, ""));
+  rows = parsed.map(d => ({ a: d.chrom_a, b: d.chrom_b, band: d.lift_band, n: +d.n_edges, w: +d.mean_weight }))
+               .filter(d => CHRS.includes(d.a) && CHRS.includes(d.b) && d.n > 0);
+  if (!rows.length) throw new Error("no usable rows (expected columns chrom_a chrom_b lift_band n_edges mean_weight)");
+  bandNames = Array.from(new Set(rows.map(d => d.band))).sort((x, y) => bandLo(x) - bandLo(y));
+  const want = Q.get("bands") ? new Set(Q.get("bands").split(",")) : null;
+  active = new Set(want ? bandNames.filter(b => want.has(b)) : bandNames);
+  buildControls(); draw();
+}
+
+function buildControls() {
+  const host = d3.select("#bands").html("");
+  bandNames.forEach(b => {
+    const l = host.append("label").attr("class", "chip");
+    l.append("input").attr("type", "checkbox").property("checked", active.has(b)).on("change", e => {
+      e.target.checked ? active.add(b) : active.delete(b); draw();
+    });
+    l.append("span").text(b.startsWith(">=") ? "≥ " + b.slice(2) : b.replace("-", "–"));
+  });
+}
+
+/* ---------- data -> matrix ---------- */
+function matrix() {
+  const idx = Object.fromEntries(CHRS.map((c, i) => [c, i]));
+  const m = CHRS.map(() => CHRS.map(() => 0)), raw = CHRS.map(() => CHRS.map(() => 0));
+  const byBand = CHRS.map(() => CHRS.map(() => ({})));
+  for (const d of rows) {
+    if (!active.has(d.band)) continue;
+    const i = idx[d.a], j = idx[d.b];
+    if (i === j && !showSame) continue;
+    raw[i][j] += d.n; if (i !== j) raw[j][i] += d.n;
+    byBand[i][j][d.band] = d; if (i !== j) byBand[j][i][d.band] = d;
+  }
+  for (let i = 0; i < 22; i++) for (let j = 0; j < 22; j++) m[i][j] = scaleMode === "sqrt" ? Math.sqrt(raw[i][j]) : raw[i][j];
+  return { m, raw, byBand };
+}
+
+/* ---------- drawing (also used for the white-background export) ---------- */
+function render(svg, P, interactive) {
+  svg.selectAll("*").remove();
+  const W = 820, H = 860, cx = W / 2, cy = 440, outer = 300, inner = 284;
+  const { m, raw, byBand } = matrix();
+  const total = d3.sum(raw.flat()) / 2 + d3.sum(raw.map((r, i) => r[i] / 2));      // each pair counted once
+  svg.append("rect").attr("width", W).attr("height", H).attr("fill", P.bg);
+  svg.append("text").attr("x", 24).attr("y", 34).attr("fill", P.ink).attr("font-size", 20).attr("font-weight", 600)
+     .attr("font-family", "system-ui,Arial,sans-serif").text(CFG.title);
+  svg.append("text").attr("x", 24).attr("y", 56).attr("fill", P.muted).attr("font-size", 13)
+     .attr("font-family", "system-ui,Arial,sans-serif").text(CFG.cohort + " · " + CFG.threshold);
+  if (CFG.note) svg.append("text").attr("x", W - 24).attr("y", 34).attr("text-anchor", "end").attr("fill", "#c2410c")
+     .attr("font-size", 14).attr("font-weight", 700).attr("font-family", "system-ui,Arial,sans-serif").text(CFG.note);
+
+  const g = svg.append("g").attr("transform", `translate(${cx},${cy})`);
+  const chord = d3.chord().padAngle(0.025).sortSubgroups(d3.descending)(m);
+  const arc = d3.arc().innerRadius(inner).outerRadius(outer);
+  const ribbon = d3.ribbon().radius(inner - 2);
+
+  const dim = d => focus !== null && d.source.index !== focus && d.target.index !== focus;
+
+  const rib = g.append("g").selectAll("path").data(chord).join("path").attr("class", "rib")
+    .attr("d", ribbon).attr("fill", d => COL(d.source.index)).attr("fill-opacity", d => dim(d) ? 0.05 : 0.55)
+    .attr("stroke", d => d3.color(COL(d.source.index)).darker(0.6)).attr("stroke-opacity", d => dim(d) ? 0.05 : 0.5).attr("stroke-width", 0.4);
+
+  const grp = g.append("g").selectAll("g").data(chord.groups).join("g");
+  grp.append("path").attr("class", "arc").attr("d", arc).attr("fill", d => COL(d.index)).attr("stroke", P.bg).attr("stroke-width", 1)
+     .attr("opacity", d => focus === null || focus === d.index ? 1 : 0.35).style("cursor", interactive ? "pointer" : null);
+  grp.append("text").each(d => { d.angle = (d.startAngle + d.endAngle) / 2; })
+     .attr("transform", d => `rotate(${d.angle * 180 / Math.PI - 90}) translate(${outer + 14}) ${d.angle > Math.PI ? "rotate(180)" : ""}`)
+     .attr("text-anchor", d => d.angle > Math.PI ? "end" : null).attr("dy", "0.35em").attr("fill", P.ink)
+     .attr("font-size", 13).attr("font-family", "system-ui,Arial,sans-serif").text(d => d.index + 1);
+
+  svg.append("text").attr("x", cx).attr("y", cy - 4).attr("text-anchor", "middle").attr("fill", P.ink).attr("font-size", 22)
+     .attr("font-weight", 600).attr("font-family", "system-ui,Arial,sans-serif").text(compact(total));
+  svg.append("text").attr("x", cx).attr("y", cy + 18).attr("text-anchor", "middle").attr("fill", P.muted).attr("font-size", 12.5)
+     .attr("font-family", "system-ui,Arial,sans-serif").text("edges shown");
+  const bl = bandNames.filter(b => active.has(b));
+  svg.append("text").attr("x", 24).attr("y", H - 22).attr("fill", P.muted).attr("font-size", 12)
+     .attr("font-family", "system-ui,Arial,sans-serif")
+     .text("Lift bands: " + (bl.length ? bl.map(b => b.startsWith(">=") ? "\u2265 " + b.slice(2) : b.replace("-", "\u2013")).join(", ") : "none") + (showSame ? "" : " · cross-chromosome only") +
+           " · ribbon width ∝ " + (scaleMode === "sqrt" ? "√(edges)" : "edges") + " · chromosomes 1–22");
+
+  if (interactive) {
+    const tip = d3.select("#tip");
+    const place = e => { const r = document.getElementById("chart").getBoundingClientRect();
+      tip.style("left", Math.min(e.clientX - r.left + 14, r.width - 270) + "px").style("top", (e.clientY - r.top + 14) + "px"); };
+    const bandTable = (i, j) => {
+      const bb = byBand[i][j]; let h = "";
+      bandNames.filter(b => active.has(b) && bb[b]).forEach(b => {
+        h += `<div class="muted">${b.startsWith(">=") ? "≥ " + b.slice(2) : b.replace("-", "–")}: <b style="color:var(--ink)">${fmt(bb[b].n)}</b> edges, mean weight ${bb[b].w.toFixed(1)}</div>`; });
+      return h || '<div class="muted">no edges in the selected bands</div>';
+    };
+    rib.on("mousemove", (e, d) => { const i = d.source.index, j = d.target.index;
+        tip.style("display", "block").html(`<b>chr${i + 1} – chr${j + 1}</b>${i === j ? " (same chromosome)" : ""}<div><b>${fmt(raw[i][j])}</b> edges</div>${bandTable(i, j)}`); place(e); })
+       .on("mouseleave", () => tip.style("display", "none"));
+    grp.on("mousemove", (e, d) => { const i = d.index, t = d3.sum(raw[i]) - raw[i][i] / 2;
+        tip.style("display", "block").html(`<b>chr${i + 1}</b><div><b>${fmt(t)}</b> edges touch this chromosome</div><div class="muted">${fmt(raw[i][i])} within, ${fmt(t - raw[i][i])} to other chromosomes</div>`); place(e); })
+       .on("mouseleave", () => tip.style("display", "none"))
+       .on("click", (e, d) => { focus = focus === d.index ? null : d.index; draw(); });
+  }
+  return { raw, total };
+}
+
+function panel(raw, total) {
+  const same = d3.sum(raw.map((r, i) => r[i]));
+  let h = `<h2>Selected edges</h2><table>
+    <tr><td>Total</td><td>${fmt(total)}</td></tr>
+    <tr><td>Same chromosome</td><td>${fmt(same)}</td></tr>
+    <tr><td>Cross-chromosome</td><td>${fmt(total - same)}</td></tr>
+    <tr><td class="muted">Cross share</td><td class="muted">${total ? ((total - same) / total * 100).toFixed(1) : "0"}%</td></tr></table>`;
+  if (focus !== null) {
+    const partners = raw[focus].map((n, j) => ({ j, n: j === focus ? raw[j][j] : raw[focus][j] })).sort((a, b) => b.n - a.n).slice(0, 6);
+    h += `<h2>chr${focus + 1}: top partners</h2><table>` +
+         partners.map(p => `<tr><td>${p.j === focus ? "within chr" + (focus + 1) : "chr" + (p.j + 1)}</td><td>${fmt(p.n)}</td></tr>`).join("") + "</table>";
+  } else h += `<div class="muted">Click a chromosome to see its top partners.</div>`;
+  document.getElementById("panel").innerHTML = h;
+}
+
+function draw() {
+  document.getElementById("sub").textContent = CFG.cohort + " · " + CFG.threshold;
+  const dark = document.documentElement.getAttribute("data-theme") === "dark";
+  const out = render(d3.select("#svg"), dark ? DARK : LIGHT, true);
+  panel(out.raw, out.total);
+}
+
+/* ---------- controls and exports ---------- */
+document.getElementById("same").addEventListener("change", e => { showSame = e.target.checked; draw(); });
+document.getElementById("scale").addEventListener("change", e => { scaleMode = e.target.value; draw(); });
+document.getElementById("reset").addEventListener("click", () => { focus = null; active = new Set(bandNames); showSame = true;
+  document.getElementById("same").checked = true; buildControls(); draw(); });
+
+function exportSvgString() {
+  const host = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  host.setAttribute("xmlns", "http://www.w3.org/2000/svg"); host.setAttribute("viewBox", "0 0 820 860");
+  host.setAttribute("width", 820); host.setAttribute("height", 860);
+  render(d3.select(host), LIGHT, false);
+  return new XMLSerializer().serializeToString(host);
+}
+function save(name, blob) { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); }
+document.getElementById("dlsvg").addEventListener("click", () => save("haplograph_chord.svg", new Blob([exportSvgString()], { type: "image/svg+xml" })));
+document.getElementById("dlpng").addEventListener("click", () => {
+  const img = new Image(), url = URL.createObjectURL(new Blob([exportSvgString()], { type: "image/svg+xml" }));
+  img.onload = () => { const c = document.createElement("canvas"); c.width = 820 * 3; c.height = 860 * 3; const x = c.getContext("2d");
+    x.fillStyle = "#fff"; x.fillRect(0, 0, c.width, c.height); x.drawImage(img, 0, 0, c.width, c.height);
+    c.toBlob(b => save("haplograph_chord.png", b)); URL.revokeObjectURL(url); };
+  img.src = url; });
+document.getElementById("dlcsv").addEventListener("click", () => {
+  const out = ["chrom_a,chrom_b,lift_band,n_edges,mean_weight"].concat(rows.filter(d => active.has(d.band) && (showSame || d.a !== d.b))
+    .map(d => [d.a, d.b, d.band, d.n, d.w].join(",")));
+  save("haplograph_chrpair_selected.csv", new Blob([out.join("\n") + "\n"], { type: "text/csv" })); });
+
+/* ---------- start ---------- */
+function fail(err) {
+  const m = document.getElementById("msg"); m.style.display = "block";
+  m.innerHTML = `Could not load <code>${CFG.data}</code> (${err.message}).<br>Choose the file here: <input type="file" id="pick" accept=".tsv,.txt,text/tab-separated-values">`;
+  document.getElementById("pick").addEventListener("change", e => e.target.files[0].text().then(t => { m.style.display = "none"; try { load(t); } catch (x) { fail(x); } }));
+}
+const EMBEDDED_TSV = 
+  "chrom_a\tchrom_b\tlift_band\tn_edges\tmean_weight\n" +
+  "chr1\tchr1\t10-20\t54866\t6.591\n" +
+  "chr1\tchr1\t2-3\t10402479\t21.716\n" +
+  "chr1\tchr1\t3-5\t5423942\t16.879\n" +
+  "chr1\tchr1\t5-10\t956109\t7.891\n" +
+  "chr1\tchr1\t>=20\t1000\t14.165\n" +
+  "chr1\tchr2\t10-20\t103026\t6.094\n" +
+  "chr1\tchr2\t2-3\t21654714\t21.649\n" +
+  "chr1\tchr2\t3-5\t11383280\t16.937\n" +
+  "chr1\tchr2\t5-10\t1953148\t7.789\n" +
+  "chr1\tchr2\t>=20\t558\t6.912\n" +
+  "chr1\tchr3\t10-20\t87677\t6.093\n" +
+  "chr1\tchr3\t2-3\t18440408\t21.498\n" +
+  "chr1\tchr3\t3-5\t9692883\t16.922\n" +
+  "chr1\tchr3\t5-10\t1661294\t7.784\n" +
+  "chr1\tchr3\t>=20\t496\t7.012\n" +
+  "chr1\tchr4\t10-20\t74401\t6.067\n" +
+  "chr1\tchr4\t2-3\t15775694\t21.770\n" +
+  "chr1\tchr4\t3-5\t7962652\t16.784\n" +
+  "chr1\tchr4\t5-10\t1380797\t7.705\n" +
+  "chr1\tchr4\t>=20\t477\t6.973\n" +
+  "chr1\tchr5\t10-20\t81527\t6.147\n" +
+  "chr1\tchr5\t2-3\t17016732\t21.614\n" +
+  "chr1\tchr5\t3-5\t8978477\t17.118\n" +
+  "chr1\tchr5\t5-10\t1519644\t7.795\n" +
+  "chr1\tchr5\t>=20\t464\t7.125\n" +
+  "chr1\tchr6\t10-20\t78246\t6.111\n" +
+  "chr1\tchr6\t2-3\t16281502\t21.392\n" +
+  "chr1\tchr6\t3-5\t8210855\t16.620\n" +
+  "chr1\tchr6\t5-10\t1420293\t7.741\n" +
+  "chr1\tchr6\t>=20\t481\t7.037\n" +
+  "chr1\tchr7\t10-20\t71572\t6.115\n" +
+  "chr1\tchr7\t2-3\t14828116\t21.360\n" +
+  "chr1\tchr7\t3-5\t7693544\t16.869\n" +
+  "chr1\tchr7\t5-10\t1331378\t7.764\n" +
+  "chr1\tchr7\t>=20\t483\t7.072\n" +
+  "chr1\tchr8\t10-20\t63598\t6.110\n" +
+  "chr1\tchr8\t2-3\t13647932\t21.878\n" +
+  "chr1\tchr8\t3-5\t7120291\t17.048\n" +
+  "chr1\tchr8\t5-10\t1207528\t7.762\n" +
+  "chr1\tchr8\t>=20\t324\t6.932\n" +
+  "chr1\tchr9\t10-20\t65139\t6.094\n" +
+  "chr1\tchr9\t2-3\t12843993\t21.217\n" +
+  "chr1\tchr9\t3-5\t6783329\t16.859\n" +
+  "chr1\tchr9\t5-10\t1187485\t7.726\n" +
+  "chr1\tchr9\t>=20\t348\t7.167\n" +
+  "chr1\tchr10\t10-20\t58376\t6.135\n" +
+  "chr1\tchr10\t2-3\t12946744\t21.348\n" +
+  "chr1\tchr10\t3-5\t6450303\t16.526\n" +
+  "chr1\tchr10\t5-10\t1096203\t7.726\n" +
+  "chr1\tchr10\t>=20\t343\t7.117\n" +
+  "chr1\tchr11\t10-20\t58665\t6.142\n" +
+  "chr1\tchr11\t2-3\t11940988\t21.164\n" +
+  "chr1\tchr11\t3-5\t6234018\t16.583\n" +
+  "chr1\tchr11\t5-10\t1097809\t7.767\n" +
+  "chr1\tchr11\t>=20\t350\t7.109\n" +
+  "chr1\tchr12\t10-20\t60160\t6.119\n" +
+  "chr1\tchr12\t2-3\t13133900\t21.529\n" +
+  "chr1\tchr12\t3-5\t6535758\t16.709\n" +
+  "chr1\tchr12\t5-10\t1109696\t7.759\n" +
+  "chr1\tchr12\t>=20\t362\t7.204\n" +
+  "chr1\tchr13\t10-20\t41302\t6.087\n" +
+  "chr1\tchr13\t2-3\t8820652\t21.015\n" +
+  "chr1\tchr13\t3-5\t4319780\t16.069\n" +
+  "chr1\tchr13\t5-10\t752953\t7.650\n" +
+  "chr1\tchr13\t>=20\t249\t6.888\n" +
+  "chr1\tchr14\t10-20\t42598\t6.157\n" +
+  "chr1\tchr14\t2-3\t8737122\t21.326\n" +
+  "chr1\tchr14\t3-5\t4453126\t16.713\n" +
+  "chr1\tchr14\t5-10\t768454\t7.805\n" +
+  "chr1\tchr14\t>=20\t279\t6.717\n" +
+  "chr1\tchr15\t10-20\t44161\t6.151\n" +
+  "chr1\tchr15\t2-3\t8700397\t21.338\n" +
+  "chr1\tchr15\t3-5\t4604863\t16.751\n" +
+  "chr1\tchr15\t5-10\t808702\t7.784\n" +
+  "chr1\tchr15\t>=20\t247\t7.004\n" +
+  "chr1\tchr16\t10-20\t50825\t6.176\n" +
+  "chr1\tchr16\t2-3\t9497945\t20.618\n" +
+  "chr1\tchr16\t3-5\t5149248\t16.861\n" +
+  "chr1\tchr16\t5-10\t905488\t7.783\n" +
+  "chr1\tchr16\t>=20\t291\t7.038\n" +
+  "chr1\tchr17\t10-20\t43816\t6.093\n" +
+  "chr1\tchr17\t2-3\t8998985\t20.861\n" +
+  "chr1\tchr17\t3-5\t4749355\t16.740\n" +
+  "chr1\tchr17\t5-10\t820991\t7.760\n" +
+  "chr1\tchr17\t>=20\t241\t6.834\n" +
+  "chr1\tchr18\t10-20\t41221\t6.059\n" +
+  "chr1\tchr18\t2-3\t8655890\t21.235\n" +
+  "chr1\tchr18\t3-5\t4373019\t16.438\n" +
+  "chr1\tchr18\t5-10\t761161\t7.673\n" +
+  "chr1\tchr18\t>=20\t235\t7.026\n" +
+  "chr1\tchr19\t10-20\t41794\t6.079\n" +
+  "chr1\tchr19\t2-3\t8083321\t19.687\n" +
+  "chr1\tchr19\t3-5\t4243280\t16.160\n" +
+  "chr1\tchr19\t5-10\t747865\t7.656\n" +
+  "chr1\tchr19\t>=20\t269\t7.059\n" +
+  "chr1\tchr20\t10-20\t42366\t6.086\n" +
+  "chr1\tchr20\t2-3\t8186702\t20.477\n" +
+  "chr1\tchr20\t3-5\t4344483\t16.273\n" +
+  "chr1\tchr20\t5-10\t772032\t7.684\n" +
+  "chr1\tchr20\t>=20\t279\t6.989\n" +
+  "chr1\tchr21\t10-20\t20814\t6.106\n" +
+  "chr1\tchr21\t2-3\t4097159\t21.096\n" +
+  "chr1\tchr21\t3-5\t2102843\t16.448\n" +
+  "chr1\tchr21\t5-10\t377093\t7.686\n" +
+  "chr1\tchr21\t>=20\t133\t6.880\n" +
+  "chr1\tchr22\t10-20\t26396\t6.163\n" +
+  "chr1\tchr22\t2-3\t5251367\t20.937\n" +
+  "chr1\tchr22\t3-5\t2737122\t16.863\n" +
+  "chr1\tchr22\t5-10\t481261\t7.777\n" +
+  "chr1\tchr22\t>=20\t151\t7.238\n" +
+  "chr2\tchr2\t10-20\t57979\t6.648\n" +
+  "chr2\tchr2\t2-3\t11357242\t21.799\n" +
+  "chr2\tchr2\t3-5\t6072584\t17.250\n" +
+  "chr2\tchr2\t5-10\t1044000\t8.035\n" +
+  "chr2\tchr2\t>=20\t1187\t14.429\n" +
+  "chr2\tchr3\t10-20\t89005\t6.130\n" +
+  "chr2\tchr3\t2-3\t19251271\t21.553\n" +
+  "chr2\tchr3\t3-5\t10260489\t17.114\n" +
+  "chr2\tchr3\t5-10\t1734167\t7.842\n" +
+  "chr2\tchr3\t>=20\t486\t6.852\n" +
+  "chr2\tchr4\t10-20\t76807\t6.081\n" +
+  "chr2\tchr4\t2-3\t16490158\t21.813\n" +
+  "chr2\tchr4\t3-5\t8427909\t16.961\n" +
+  "chr2\tchr4\t5-10\t1439433\t7.760\n" +
+  "chr2\tchr4\t>=20\t503\t6.926\n" +
+  "chr2\tchr5\t10-20\t83518\t6.183\n" +
+  "chr2\tchr5\t2-3\t17762106\t21.651\n" +
+  "chr2\tchr5\t3-5\t9482287\t17.289\n" +
+  "chr2\tchr5\t5-10\t1585510\t7.855\n" +
+  "chr2\tchr5\t>=20\t462\t6.890\n" +
+  "chr2\tchr6\t10-20\t80286\t6.123\n" +
+  "chr2\tchr6\t2-3\t17008611\t21.444\n" +
+  "chr2\tchr6\t3-5\t8696948\t16.798\n" +
+  "chr2\tchr6\t5-10\t1483289\t7.805\n" +
+  "chr2\tchr6\t>=20\t461\t7.024\n" +
+  "chr2\tchr7\t10-20\t73718\t6.127\n" +
+  "chr2\tchr7\t2-3\t15490812\t21.412\n" +
+  "chr2\tchr7\t3-5\t8140037\t17.053\n" +
+  "chr2\tchr7\t5-10\t1388457\t7.818\n" +
+  "chr2\tchr7\t>=20\t465\t7.052\n" +
+  "chr2\tchr8\t10-20\t64633\t6.134\n" +
+  "chr2\tchr8\t2-3\t14257805\t21.905\n" +
+  "chr2\tchr8\t3-5\t7539597\t17.229\n" +
+  "chr2\tchr8\t5-10\t1260984\t7.817\n" +
+  "chr2\tchr8\t>=20\t348\t6.943\n" +
+  "chr2\tchr9\t10-20\t66402\t6.106\n" +
+  "chr2\tchr9\t2-3\t13437231\t21.241\n" +
+  "chr2\tchr9\t3-5\t7178706\t17.042\n" +
+  "chr2\tchr9\t5-10\t1240689\t7.790\n" +
+  "chr2\tchr9\t>=20\t310\t6.968\n" +
+  "chr2\tchr10\t10-20\t60305\t6.147\n" +
+  "chr2\tchr10\t2-3\t13514077\t21.407\n" +
+  "chr2\tchr10\t3-5\t6814815\t16.700\n" +
+  "chr2\tchr10\t5-10\t1142066\t7.781\n" +
+  "chr2\tchr10\t>=20\t357\t6.885\n" +
+  "chr2\tchr11\t10-20\t60226\t6.161\n" +
+  "chr2\tchr11\t2-3\t12470770\t21.221\n" +
+  "chr2\tchr11\t3-5\t6599070\t16.736\n" +
+  "chr2\tchr11\t5-10\t1146143\t7.838\n" +
+  "chr2\tchr11\t>=20\t328\t7.162\n" +
+  "chr2\tchr12\t10-20\t61633\t6.114\n" +
+  "chr2\tchr12\t2-3\t13709825\t21.584\n" +
+  "chr2\tchr12\t3-5\t6917474\t16.889\n" +
+  "chr2\tchr12\t5-10\t1161281\t7.817\n" +
+  "chr2\tchr12\t>=20\t323\t6.910\n" +
+  "chr2\tchr13\t10-20\t42398\t6.087\n" +
+  "chr2\tchr13\t2-3\t9212330\t21.070\n" +
+  "chr2\tchr13\t3-5\t4573672\t16.262\n" +
+  "chr2\tchr13\t5-10\t786593\t7.713\n" +
+  "chr2\tchr13\t>=20\t247\t7.000\n" +
+  "chr2\tchr14\t10-20\t44318\t6.194\n" +
+  "chr2\tchr14\t2-3\t9126402\t21.379\n" +
+  "chr2\tchr14\t3-5\t4714950\t16.893\n" +
+  "chr2\tchr14\t5-10\t806929\t7.867\n" +
+  "chr2\tchr14\t>=20\t255\t6.996\n" +
+  "chr2\tchr15\t10-20\t45295\t6.168\n" +
+  "chr2\tchr15\t2-3\t9093934\t21.387\n" +
+  "chr2\tchr15\t3-5\t4871788\t16.920\n" +
+  "chr2\tchr15\t5-10\t842182\t7.834\n" +
+  "chr2\tchr15\t>=20\t258\t7.198\n" +
+  "chr2\tchr16\t10-20\t51524\t6.173\n" +
+  "chr2\tchr16\t2-3\t9912650\t20.645\n" +
+  "chr2\tchr16\t3-5\t5444412\t17.049\n" +
+  "chr2\tchr16\t5-10\t945613\t7.841\n" +
+  "chr2\tchr16\t>=20\t311\t6.881\n" +
+  "chr2\tchr17\t10-20\t44631\t6.106\n" +
+  "chr2\tchr17\t2-3\t9399975\t20.884\n" +
+  "chr2\tchr17\t3-5\t5017693\t16.895\n" +
+  "chr2\tchr17\t5-10\t853122\t7.817\n" +
+  "chr2\tchr17\t>=20\t254\t6.823\n" +
+  "chr2\tchr18\t10-20\t42634\t6.077\n" +
+  "chr2\tchr18\t2-3\t9045148\t21.285\n" +
+  "chr2\tchr18\t3-5\t4629855\t16.618\n" +
+  "chr2\tchr18\t5-10\t795469\t7.737\n" +
+  "chr2\tchr18\t>=20\t244\t6.996\n" +
+  "chr2\tchr19\t10-20\t43207\t6.093\n" +
+  "chr2\tchr19\t2-3\t8441753\t19.727\n" +
+  "chr2\tchr19\t3-5\t4491610\t16.345\n" +
+  "chr2\tchr19\t5-10\t782571\t7.720\n" +
+  "chr2\tchr19\t>=20\t232\t7.047\n" +
+  "chr2\tchr20\t10-20\t43151\t6.100\n" +
+  "chr2\tchr20\t2-3\t8552698\t20.506\n" +
+  "chr2\tchr20\t3-5\t4596380\t16.421\n" +
+  "chr2\tchr20\t5-10\t805948\t7.751\n" +
+  "chr2\tchr20\t>=20\t271\t6.897\n" +
+  "chr2\tchr21\t10-20\t21642\t6.152\n" +
+  "chr2\tchr21\t2-3\t4282020\t21.161\n" +
+  "chr2\tchr21\t3-5\t2231621\t16.616\n" +
+  "chr2\tchr21\t5-10\t396159\t7.752\n" +
+  "chr2\tchr21\t>=20\t119\t7.034\n" +
+  "chr2\tchr22\t10-20\t27230\t6.184\n" +
+  "chr2\tchr22\t2-3\t5486206\t20.985\n" +
+  "chr2\tchr22\t3-5\t2896446\t17.034\n" +
+  "chr2\tchr22\t5-10\t502548\t7.836\n" +
+  "chr2\tchr22\t>=20\t150\t7.213\n" +
+  "chr3\tchr3\t10-20\t42744\t6.787\n" +
+  "chr3\tchr3\t2-3\t8233258\t21.567\n" +
+  "chr3\tchr3\t3-5\t4417615\t17.266\n" +
+  "chr3\tchr3\t5-10\t763898\t8.063\n" +
+  "chr3\tchr3\t>=20\t1033\t15.844\n" +
+  "chr3\tchr4\t10-20\t64744\t6.084\n" +
+  "chr3\tchr4\t2-3\t14027370\t21.677\n" +
+  "chr3\tchr4\t3-5\t7175626\t16.935\n" +
+  "chr3\tchr4\t5-10\t1226944\t7.755\n" +
+  "chr3\tchr4\t>=20\t427\t6.977\n" +
+  "chr3\tchr5\t10-20\t70255\t6.176\n" +
+  "chr3\tchr5\t2-3\t15119617\t21.516\n" +
+  "chr3\tchr5\t3-5\t8089925\t17.307\n" +
+  "chr3\tchr5\t5-10\t1354597\t7.851\n" +
+  "chr3\tchr5\t>=20\t386\t6.821\n" +
+  "chr3\tchr6\t10-20\t67529\t6.113\n" +
+  "chr3\tchr6\t2-3\t14472148\t21.308\n" +
+  "chr3\tchr6\t3-5\t7406692\t16.795\n" +
+  "chr3\tchr6\t5-10\t1265873\t7.802\n" +
+  "chr3\tchr6\t>=20\t412\t6.995\n" +
+  "chr3\tchr7\t10-20\t62193\t6.131\n" +
+  "chr3\tchr7\t2-3\t13187108\t21.271\n" +
+  "chr3\tchr7\t3-5\t6935718\t17.041\n" +
+  "chr3\tchr7\t5-10\t1183227\t7.812\n" +
+  "chr3\tchr7\t>=20\t418\t7.014\n" +
+  "chr3\tchr8\t10-20\t54582\t6.117\n" +
+  "chr3\tchr8\t2-3\t12121424\t21.759\n" +
+  "chr3\tchr8\t3-5\t6401085\t17.203\n" +
+  "chr3\tchr8\t5-10\t1071218\t7.803\n" +
+  "chr3\tchr8\t>=20\t309\t6.906\n" +
+  "chr3\tchr9\t10-20\t55965\t6.113\n" +
+  "chr3\tchr9\t2-3\t11425670\t21.117\n" +
+  "chr3\tchr9\t3-5\t6119697\t17.037\n" +
+  "chr3\tchr9\t5-10\t1056784\t7.786\n" +
+  "chr3\tchr9\t>=20\t335\t6.922\n" +
+  "chr3\tchr10\t10-20\t51104\t6.162\n" +
+  "chr3\tchr10\t2-3\t11502990\t21.270\n" +
+  "chr3\tchr10\t3-5\t5802269\t16.678\n" +
+  "chr3\tchr10\t5-10\t974080\t7.774\n" +
+  "chr3\tchr10\t>=20\t310\t7.165\n" +
+  "chr3\tchr11\t10-20\t51156\t6.156\n" +
+  "chr3\tchr11\t2-3\t10614087\t21.079\n" +
+  "chr3\tchr11\t3-5\t5617048\t16.737\n" +
+  "chr3\tchr11\t5-10\t977290\t7.829\n" +
+  "chr3\tchr11\t>=20\t315\t6.822\n" +
+  "chr3\tchr12\t10-20\t51729\t6.131\n" +
+  "chr3\tchr12\t2-3\t11670666\t21.450\n" +
+  "chr3\tchr12\t3-5\t5892662\t16.882\n" +
+  "chr3\tchr12\t5-10\t991408\t7.816\n" +
+  "chr3\tchr12\t>=20\t294\t6.932\n" +
+  "chr3\tchr13\t10-20\t35888\t6.084\n" +
+  "chr3\tchr13\t2-3\t7841896\t20.950\n" +
+  "chr3\tchr13\t3-5\t3893986\t16.226\n" +
+  "chr3\tchr13\t5-10\t670650\t7.708\n" +
+  "chr3\tchr13\t>=20\t223\t6.906\n" +
+  "chr3\tchr14\t10-20\t37060\t6.188\n" +
+  "chr3\tchr14\t2-3\t7766134\t21.247\n" +
+  "chr3\tchr14\t3-5\t4016587\t16.895\n" +
+  "chr3\tchr14\t5-10\t688243\t7.864\n" +
+  "chr3\tchr14\t>=20\t259\t6.753\n" +
+  "chr3\tchr15\t10-20\t37952\t6.194\n" +
+  "chr3\tchr15\t2-3\t7737835\t21.233\n" +
+  "chr3\tchr15\t3-5\t4147785\t16.908\n" +
+  "chr3\tchr15\t5-10\t719746\t7.829\n" +
+  "chr3\tchr15\t>=20\t275\t6.953\n" +
+  "chr3\tchr16\t10-20\t43920\t6.210\n" +
+  "chr3\tchr16\t2-3\t8440575\t20.498\n" +
+  "chr3\tchr16\t3-5\t4640392\t17.021\n" +
+  "chr3\tchr16\t5-10\t808573\t7.842\n" +
+  "chr3\tchr16\t>=20\t275\t7.076\n" +
+  "chr3\tchr17\t10-20\t38330\t6.104\n" +
+  "chr3\tchr17\t2-3\t8000619\t20.742\n" +
+  "chr3\tchr17\t3-5\t4278203\t16.890\n" +
+  "chr3\tchr17\t5-10\t730926\t7.806\n" +
+  "chr3\tchr17\t>=20\t220\t6.727\n" +
+  "chr3\tchr18\t10-20\t35749\t6.085\n" +
+  "chr3\tchr18\t2-3\t7701599\t21.162\n" +
+  "chr3\tchr18\t3-5\t3951825\t16.614\n" +
+  "chr3\tchr18\t5-10\t679190\t7.738\n" +
+  "chr3\tchr18\t>=20\t221\t6.986\n" +
+  "chr3\tchr19\t10-20\t36493\t6.094\n" +
+  "chr3\tchr19\t2-3\t7190267\t19.588\n" +
+  "chr3\tchr19\t3-5\t3835763\t16.349\n" +
+  "chr3\tchr19\t5-10\t670734\t7.720\n" +
+  "chr3\tchr19\t>=20\t236\t7.250\n" +
+  "chr3\tchr20\t10-20\t36729\t6.126\n" +
+  "chr3\tchr20\t2-3\t7269323\t20.375\n" +
+  "chr3\tchr20\t3-5\t3917620\t16.398\n" +
+  "chr3\tchr20\t5-10\t687186\t7.741\n" +
+  "chr3\tchr20\t>=20\t259\t7.050\n" +
+  "chr3\tchr21\t10-20\t18306\t6.117\n" +
+  "chr3\tchr21\t2-3\t3650175\t21.013\n" +
+  "chr3\tchr21\t3-5\t1896682\t16.586\n" +
+  "chr3\tchr21\t5-10\t337580\t7.756\n" +
+  "chr3\tchr21\t>=20\t118\t6.958\n" +
+  "chr3\tchr22\t10-20\t23208\t6.187\n" +
+  "chr3\tchr22\t2-3\t4670146\t20.857\n" +
+  "chr3\tchr22\t3-5\t2468976\t17.023\n" +
+  "chr3\tchr22\t5-10\t428858\t7.829\n" +
+  "chr3\tchr22\t>=20\t162\t6.988\n" +
+  "chr4\tchr4\t10-20\t30970\t6.644\n" +
+  "chr4\tchr4\t2-3\t6040307\t22.098\n" +
+  "chr4\tchr4\t3-5\t2995769\t17.021\n" +
+  "chr4\tchr4\t5-10\t528144\t7.917\n" +
+  "chr4\tchr4\t>=20\t690\t14.365\n" +
+  "chr4\tchr5\t10-20\t60382\t6.139\n" +
+  "chr4\tchr5\t2-3\t12941504\t21.811\n" +
+  "chr4\tchr5\t3-5\t6654207\t17.161\n" +
+  "chr4\tchr5\t5-10\t1121881\t7.780\n" +
+  "chr4\tchr5\t>=20\t375\t7.133\n" +
+  "chr4\tchr6\t10-20\t58139\t6.079\n" +
+  "chr4\tchr6\t2-3\t12384555\t21.531\n" +
+  "chr4\tchr6\t3-5\t6076276\t16.624\n" +
+  "chr4\tchr6\t5-10\t1045366\t7.719\n" +
+  "chr4\tchr6\t>=20\t364\t6.827\n" +
+  "chr4\tchr7\t10-20\t53470\t6.084\n" +
+  "chr4\tchr7\t2-3\t11279736\t21.531\n" +
+  "chr4\tchr7\t3-5\t5690414\t16.875\n" +
+  "chr4\tchr7\t5-10\t979352\t7.725\n" +
+  "chr4\tchr7\t>=20\t427\t7.016\n" +
+  "chr4\tchr8\t10-20\t47331\t6.079\n" +
+  "chr4\tchr8\t2-3\t10385343\t22.053\n" +
+  "chr4\tchr8\t3-5\t5276579\t17.081\n" +
+  "chr4\tchr8\t5-10\t890275\t7.738\n" +
+  "chr4\tchr8\t>=20\t260\t7.015\n" +
+  "chr4\tchr9\t10-20\t47809\t6.073\n" +
+  "chr4\tchr9\t2-3\t9786586\t21.391\n" +
+  "chr4\tchr9\t3-5\t5022472\t16.886\n" +
+  "chr4\tchr9\t5-10\t874574\t7.701\n" +
+  "chr4\tchr9\t>=20\t317\t7.032\n" +
+  "chr4\tchr10\t10-20\t43558\t6.120\n" +
+  "chr4\tchr10\t2-3\t9842093\t21.499\n" +
+  "chr4\tchr10\t3-5\t4776969\t16.525\n" +
+  "chr4\tchr10\t5-10\t809348\t7.705\n" +
+  "chr4\tchr10\t>=20\t283\t7.081\n" +
+  "chr4\tchr11\t10-20\t43840\t6.123\n" +
+  "chr4\tchr11\t2-3\t9096722\t21.345\n" +
+  "chr4\tchr11\t3-5\t4624926\t16.602\n" +
+  "chr4\tchr11\t5-10\t810213\t7.758\n" +
+  "chr4\tchr11\t>=20\t315\t7.175\n" +
+  "chr4\tchr12\t10-20\t44576\t6.111\n" +
+  "chr4\tchr12\t2-3\t9987471\t21.679\n" +
+  "chr4\tchr12\t3-5\t4851772\t16.723\n" +
+  "chr4\tchr12\t5-10\t821006\t7.737\n" +
+  "chr4\tchr12\t>=20\t281\t7.082\n" +
+  "chr4\tchr13\t10-20\t31143\t6.069\n" +
+  "chr4\tchr13\t2-3\t6702061\t21.156\n" +
+  "chr4\tchr13\t3-5\t3204486\t16.093\n" +
+  "chr4\tchr13\t5-10\t554683\t7.643\n" +
+  "chr4\tchr13\t>=20\t185\t7.146\n" +
+  "chr4\tchr14\t10-20\t32485\t6.168\n" +
+  "chr4\tchr14\t2-3\t6650081\t21.482\n" +
+  "chr4\tchr14\t3-5\t3303675\t16.729\n" +
+  "chr4\tchr14\t5-10\t569652\t7.784\n" +
+  "chr4\tchr14\t>=20\t215\t6.902\n" +
+  "chr4\tchr15\t10-20\t32396\t6.127\n" +
+  "chr4\tchr15\t2-3\t6621782\t21.517\n" +
+  "chr4\tchr15\t3-5\t3410286\t16.764\n" +
+  "chr4\tchr15\t5-10\t595804\t7.759\n" +
+  "chr4\tchr15\t>=20\t216\t7.176\n" +
+  "chr4\tchr16\t10-20\t37649\t6.158\n" +
+  "chr4\tchr16\t2-3\t7235707\t20.829\n" +
+  "chr4\tchr16\t3-5\t3816579\t16.873\n" +
+  "chr4\tchr16\t5-10\t668605\t7.767\n" +
+  "chr4\tchr16\t>=20\t255\t7.278\n" +
+  "chr4\tchr17\t10-20\t32724\t6.071\n" +
+  "chr4\tchr17\t2-3\t6849125\t21.037\n" +
+  "chr4\tchr17\t3-5\t3512801\t16.724\n" +
+  "chr4\tchr17\t5-10\t604306\t7.727\n" +
+  "chr4\tchr17\t>=20\t200\t6.775\n" +
+  "chr4\tchr18\t10-20\t31081\t6.057\n" +
+  "chr4\tchr18\t2-3\t6590432\t21.386\n" +
+  "chr4\tchr18\t3-5\t3250387\t16.466\n" +
+  "chr4\tchr18\t5-10\t563325\t7.662\n" +
+  "chr4\tchr18\t>=20\t189\t6.937\n" +
+  "chr4\tchr19\t10-20\t31476\t6.071\n" +
+  "chr4\tchr19\t2-3\t6151503\t19.877\n" +
+  "chr4\tchr19\t3-5\t3146715\t16.183\n" +
+  "chr4\tchr19\t5-10\t553673\t7.642\n" +
+  "chr4\tchr19\t>=20\t197\t6.964\n" +
+  "chr4\tchr20\t10-20\t31082\t6.052\n" +
+  "chr4\tchr20\t2-3\t6232851\t20.663\n" +
+  "chr4\tchr20\t3-5\t3221118\t16.294\n" +
+  "chr4\tchr20\t5-10\t569030\t7.663\n" +
+  "chr4\tchr20\t>=20\t211\t6.929\n" +
+  "chr4\tchr21\t10-20\t15563\t6.076\n" +
+  "chr4\tchr21\t2-3\t3118892\t21.296\n" +
+  "chr4\tchr21\t3-5\t1561847\t16.484\n" +
+  "chr4\tchr21\t5-10\t278450\t7.662\n" +
+  "chr4\tchr21\t>=20\t94\t6.894\n" +
+  "chr4\tchr22\t10-20\t19710\t6.151\n" +
+  "chr4\tchr22\t2-3\t4004120\t21.123\n" +
+  "chr4\tchr22\t3-5\t2028879\t16.855\n" +
+  "chr4\tchr22\t5-10\t355838\t7.745\n" +
+  "chr4\tchr22\t>=20\t154\t7.175\n" +
+  "chr5\tchr5\t10-20\t36366\t6.886\n" +
+  "chr5\tchr5\t2-3\t7011723\t21.803\n" +
+  "chr5\tchr5\t3-5\t3803454\t17.714\n" +
+  "chr5\tchr5\t5-10\t641774\t8.122\n" +
+  "chr5\tchr5\t>=20\t798\t15.054\n" +
+  "chr5\tchr6\t10-20\t62072\t6.177\n" +
+  "chr5\tchr6\t2-3\t13353913\t21.426\n" +
+  "chr5\tchr6\t3-5\t6854153\t16.965\n" +
+  "chr5\tchr6\t5-10\t1155967\t7.809\n" +
+  "chr5\tchr6\t>=20\t345\t6.884\n" +
+  "chr5\tchr7\t10-20\t57699\t6.182\n" +
+  "chr5\tchr7\t2-3\t12168605\t21.380\n" +
+  "chr5\tchr7\t3-5\t6422345\t17.233\n" +
+  "chr5\tchr7\t5-10\t1083505\t7.828\n" +
+  "chr5\tchr7\t>=20\t344\t7.029\n" +
+  "chr5\tchr8\t10-20\t50737\t6.185\n" +
+  "chr5\tchr8\t2-3\t11195422\t21.900\n" +
+  "chr5\tchr8\t3-5\t5938787\t17.405\n" +
+  "chr5\tchr8\t5-10\t980956\t7.823\n" +
+  "chr5\tchr8\t>=20\t273\t6.824\n" +
+  "chr5\tchr9\t10-20\t51640\t6.165\n" +
+  "chr5\tchr9\t2-3\t10550395\t21.208\n" +
+  "chr5\tchr9\t3-5\t5666574\t17.236\n" +
+  "chr5\tchr9\t5-10\t965973\t7.797\n" +
+  "chr5\tchr9\t>=20\t285\t7.021\n" +
+  "chr5\tchr10\t10-20\t47058\t6.230\n" +
+  "chr5\tchr10\t2-3\t10618354\t21.386\n" +
+  "chr5\tchr10\t3-5\t5371780\t16.888\n" +
+  "chr5\tchr10\t5-10\t889668\t7.794\n" +
+  "chr5\tchr10\t>=20\t259\t7.097\n" +
+  "chr5\tchr11\t10-20\t47726\t6.238\n" +
+  "chr5\tchr11\t2-3\t9792822\t21.195\n" +
+  "chr5\tchr11\t3-5\t5213953\t16.947\n" +
+  "chr5\tchr11\t5-10\t894047\t7.848\n" +
+  "chr5\tchr11\t>=20\t285\t7.200\n" +
+  "chr5\tchr12\t10-20\t48152\t6.205\n" +
+  "chr5\tchr12\t2-3\t10768304\t21.571\n" +
+  "chr5\tchr12\t3-5\t5452692\t17.069\n" +
+  "chr5\tchr12\t5-10\t905452\t7.826\n" +
+  "chr5\tchr12\t>=20\t269\t6.866\n" +
+  "chr5\tchr13\t10-20\t33792\t6.159\n" +
+  "chr5\tchr13\t2-3\t7239337\t21.071\n" +
+  "chr5\tchr13\t3-5\t3611365\t16.435\n" +
+  "chr5\tchr13\t5-10\t614495\t7.741\n" +
+  "chr5\tchr13\t>=20\t208\t6.812\n" +
+  "chr5\tchr14\t10-20\t34662\t6.252\n" +
+  "chr5\tchr14\t2-3\t7165976\t21.358\n" +
+  "chr5\tchr14\t3-5\t3719393\t17.106\n" +
+  "chr5\tchr14\t5-10\t629541\t7.892\n" +
+  "chr5\tchr14\t>=20\t195\t6.959\n" +
+  "chr5\tchr15\t10-20\t35661\t6.239\n" +
+  "chr5\tchr15\t2-3\t7140455\t21.336\n" +
+  "chr5\tchr15\t3-5\t3846491\t17.131\n" +
+  "chr5\tchr15\t5-10\t658843\t7.856\n" +
+  "chr5\tchr15\t>=20\t210\t7.238\n" +
+  "chr5\tchr16\t10-20\t40230\t6.277\n" +
+  "chr5\tchr16\t2-3\t7782212\t20.587\n" +
+  "chr5\tchr16\t3-5\t4301908\t17.236\n" +
+  "chr5\tchr16\t5-10\t738406\t7.852\n" +
+  "chr5\tchr16\t>=20\t247\t7.028\n" +
+  "chr5\tchr17\t10-20\t35416\t6.170\n" +
+  "chr5\tchr17\t2-3\t7383592\t20.849\n" +
+  "chr5\tchr17\t3-5\t3963328\t17.102\n" +
+  "chr5\tchr17\t5-10\t669439\t7.830\n" +
+  "chr5\tchr17\t>=20\t197\t6.873\n" +
+  "chr5\tchr18\t10-20\t33208\t6.113\n" +
+  "chr5\tchr18\t2-3\t7101798\t21.267\n" +
+  "chr5\tchr18\t3-5\t3651839\t16.798\n" +
+  "chr5\tchr18\t5-10\t618845\t7.742\n" +
+  "chr5\tchr18\t>=20\t182\t7.066\n" +
+  "chr5\tchr19\t10-20\t33870\t6.144\n" +
+  "chr5\tchr19\t2-3\t6632873\t19.644\n" +
+  "chr5\tchr19\t3-5\t3543379\t16.532\n" +
+  "chr5\tchr19\t5-10\t609712\t7.740\n" +
+  "chr5\tchr19\t>=20\t213\t6.939\n" +
+  "chr5\tchr20\t10-20\t34158\t6.174\n" +
+  "chr5\tchr20\t2-3\t6721041\t20.475\n" +
+  "chr5\tchr20\t3-5\t3638532\t16.634\n" +
+  "chr5\tchr20\t5-10\t631927\t7.768\n" +
+  "chr5\tchr20\t>=20\t231\t7.009\n" +
+  "chr5\tchr21\t10-20\t16660\t6.148\n" +
+  "chr5\tchr21\t2-3\t3362507\t21.134\n" +
+  "chr5\tchr21\t3-5\t1758923\t16.794\n" +
+  "chr5\tchr21\t5-10\t307419\t7.774\n" +
+  "chr5\tchr21\t>=20\t86\t7.151\n" +
+  "chr5\tchr22\t10-20\t21282\t6.270\n" +
+  "chr5\tchr22\t2-3\t4307243\t20.964\n" +
+  "chr5\tchr22\t3-5\t2286764\t17.233\n" +
+  "chr5\tchr22\t5-10\t392080\t7.834\n" +
+  "chr5\tchr22\t>=20\t141\t7.511\n" +
+  "chr6\tchr6\t10-20\t33673\t6.859\n" +
+  "chr6\tchr6\t2-3\t6430385\t21.382\n" +
+  "chr6\tchr6\t3-5\t3187142\t16.692\n" +
+  "chr6\tchr6\t5-10\t558361\t8.044\n" +
+  "chr6\tchr6\t>=20\t902\t14.887\n" +
+  "chr6\tchr7\t10-20\t55627\t6.140\n" +
+  "chr6\tchr7\t2-3\t11643443\t21.169\n" +
+  "chr6\tchr7\t3-5\t5882312\t16.736\n" +
+  "chr6\tchr7\t5-10\t1011296\t7.773\n" +
+  "chr6\tchr7\t>=20\t345\t6.893\n" +
+  "chr6\tchr8\t10-20\t49071\t6.147\n" +
+  "chr6\tchr8\t2-3\t10710619\t21.662\n" +
+  "chr6\tchr8\t3-5\t5443333\t16.921\n" +
+  "chr6\tchr8\t5-10\t918491\t7.783\n" +
+  "chr6\tchr8\t>=20\t256\t6.980\n" +
+  "chr6\tchr9\t10-20\t49622\t6.106\n" +
+  "chr6\tchr9\t2-3\t10097598\t21.023\n" +
+  "chr6\tchr9\t3-5\t5187721\t16.737\n" +
+  "chr6\tchr9\t5-10\t900588\t7.742\n" +
+  "chr6\tchr9\t>=20\t278\t6.968\n" +
+  "chr6\tchr10\t10-20\t44949\t6.170\n" +
+  "chr6\tchr10\t2-3\t10155653\t21.136\n" +
+  "chr6\tchr10\t3-5\t4923687\t16.389\n" +
+  "chr6\tchr10\t5-10\t832924\t7.742\n" +
+  "chr6\tchr10\t>=20\t291\t7.048\n" +
+  "chr6\tchr11\t10-20\t45261\t6.168\n" +
+  "chr6\tchr11\t2-3\t9384226\t20.985\n" +
+  "chr6\tchr11\t3-5\t4774251\t16.458\n" +
+  "chr6\tchr11\t5-10\t837919\t7.797\n" +
+  "chr6\tchr11\t>=20\t276\t7.040\n" +
+  "chr6\tchr12\t10-20\t46746\t6.129\n" +
+  "chr6\tchr12\t2-3\t10308951\t21.316\n" +
+  "chr6\tchr12\t3-5\t4992501\t16.558\n" +
+  "chr6\tchr12\t5-10\t845069\t7.774\n" +
+  "chr6\tchr12\t>=20\t265\t6.860\n" +
+  "chr6\tchr13\t10-20\t31829\t6.103\n" +
+  "chr6\tchr13\t2-3\t6925884\t20.813\n" +
+  "chr6\tchr13\t3-5\t3302154\t15.932\n" +
+  "chr6\tchr13\t5-10\t571587\t7.668\n" +
+  "chr6\tchr13\t>=20\t184\t6.815\n" +
+  "chr6\tchr14\t10-20\t33182\t6.196\n" +
+  "chr6\tchr14\t2-3\t6861179\t21.134\n" +
+  "chr6\tchr14\t3-5\t3412702\t16.575\n" +
+  "chr6\tchr14\t5-10\t589490\t7.830\n" +
+  "chr6\tchr14\t>=20\t219\t6.790\n" +
+  "chr6\tchr15\t10-20\t33614\t6.178\n" +
+  "chr6\tchr15\t2-3\t6841689\t21.142\n" +
+  "chr6\tchr15\t3-5\t3523267\t16.628\n" +
+  "chr6\tchr15\t5-10\t615465\t7.801\n" +
+  "chr6\tchr15\t>=20\t190\t6.905\n" +
+  "chr6\tchr16\t10-20\t38861\t6.178\n" +
+  "chr6\tchr16\t2-3\t7468981\t20.456\n" +
+  "chr6\tchr16\t3-5\t3942745\t16.740\n" +
+  "chr6\tchr16\t5-10\t690656\t7.795\n" +
+  "chr6\tchr16\t>=20\t243\t7.091\n" +
+  "chr6\tchr17\t10-20\t33645\t6.118\n" +
+  "chr6\tchr17\t2-3\t7070679\t20.663\n" +
+  "chr6\tchr17\t3-5\t3628605\t16.589\n" +
+  "chr6\tchr17\t5-10\t623926\t7.774\n" +
+  "chr6\tchr17\t>=20\t199\t7.005\n" +
+  "chr6\tchr18\t10-20\t32107\t6.098\n" +
+  "chr6\tchr18\t2-3\t6804631\t21.043\n" +
+  "chr6\tchr18\t3-5\t3354752\t16.332\n" +
+  "chr6\tchr18\t5-10\t579803\t7.683\n" +
+  "chr6\tchr18\t>=20\t189\t6.857\n" +
+  "chr6\tchr19\t10-20\t32209\t6.102\n" +
+  "chr6\tchr19\t2-3\t6360867\t19.534\n" +
+  "chr6\tchr19\t3-5\t3244740\t16.041\n" +
+  "chr6\tchr19\t5-10\t570013\t7.679\n" +
+  "chr6\tchr19\t>=20\t185\t6.941\n" +
+  "chr6\tchr20\t10-20\t32469\t6.081\n" +
+  "chr6\tchr20\t2-3\t6427948\t20.293\n" +
+  "chr6\tchr20\t3-5\t3314423\t16.128\n" +
+  "chr6\tchr20\t5-10\t585360\t7.705\n" +
+  "chr6\tchr20\t>=20\t227\t6.696\n" +
+  "chr6\tchr21\t10-20\t16127\t6.154\n" +
+  "chr6\tchr21\t2-3\t3221993\t20.876\n" +
+  "chr6\tchr21\t3-5\t1610744\t16.294\n" +
+  "chr6\tchr21\t5-10\t287175\t7.698\n" +
+  "chr6\tchr21\t>=20\t115\t6.861\n" +
+  "chr6\tchr22\t10-20\t20468\t6.200\n" +
+  "chr6\tchr22\t2-3\t4126944\t20.781\n" +
+  "chr6\tchr22\t3-5\t2093608\t16.732\n" +
+  "chr6\tchr22\t5-10\t366895\t7.782\n" +
+  "chr6\tchr22\t>=20\t136\t6.853\n" +
+  "chr7\tchr7\t10-20\t28596\t6.874\n" +
+  "chr7\tchr7\t2-3\t5331902\t21.291\n" +
+  "chr7\tchr7\t3-5\t2785088\t17.134\n" +
+  "chr7\tchr7\t5-10\t488874\t8.053\n" +
+  "chr7\tchr7\t>=20\t738\t14.098\n" +
+  "chr7\tchr8\t10-20\t45201\t6.135\n" +
+  "chr7\tchr8\t2-3\t9757570\t21.619\n" +
+  "chr7\tchr8\t3-5\t5090419\t17.139\n" +
+  "chr7\tchr8\t5-10\t860623\t7.787\n" +
+  "chr7\tchr8\t>=20\t284\t7.018\n" +
+  "chr7\tchr9\t10-20\t46249\t6.114\n" +
+  "chr7\tchr9\t2-3\t9195431\t20.966\n" +
+  "chr7\tchr9\t3-5\t4854915\t16.980\n" +
+  "chr7\tchr9\t5-10\t848549\t7.752\n" +
+  "chr7\tchr9\t>=20\t291\t7.172\n" +
+  "chr7\tchr10\t10-20\t41528\t6.157\n" +
+  "chr7\tchr10\t2-3\t9260665\t21.132\n" +
+  "chr7\tchr10\t3-5\t4609671\t16.636\n" +
+  "chr7\tchr10\t5-10\t781157\t7.761\n" +
+  "chr7\tchr10\t>=20\t265\t7.121\n" +
+  "chr7\tchr11\t10-20\t41919\t6.177\n" +
+  "chr7\tchr11\t2-3\t8540932\t20.940\n" +
+  "chr7\tchr11\t3-5\t4460343\t16.674\n" +
+  "chr7\tchr11\t5-10\t782061\t7.807\n" +
+  "chr7\tchr11\t>=20\t261\t7.425\n" +
+  "chr7\tchr12\t10-20\t43209\t6.148\n" +
+  "chr7\tchr12\t2-3\t9393978\t21.322\n" +
+  "chr7\tchr12\t3-5\t4685522\t16.830\n" +
+  "chr7\tchr12\t5-10\t794927\t7.793\n" +
+  "chr7\tchr12\t>=20\t295\t7.410\n" +
+  "chr7\tchr13\t10-20\t29809\t6.088\n" +
+  "chr7\tchr13\t2-3\t6311632\t20.799\n" +
+  "chr7\tchr13\t3-5\t3085396\t16.168\n" +
+  "chr7\tchr13\t5-10\t536218\t7.673\n" +
+  "chr7\tchr13\t>=20\t192\t6.927\n" +
+  "chr7\tchr14\t10-20\t31002\t6.182\n" +
+  "chr7\tchr14\t2-3\t6253879\t21.102\n" +
+  "chr7\tchr14\t3-5\t3188035\t16.831\n" +
+  "chr7\tchr14\t5-10\t551933\t7.834\n" +
+  "chr7\tchr14\t>=20\t202\t6.871\n" +
+  "chr7\tchr15\t10-20\t31241\t6.192\n" +
+  "chr7\tchr15\t2-3\t6232191\t21.103\n" +
+  "chr7\tchr15\t3-5\t3297398\t16.863\n" +
+  "chr7\tchr15\t5-10\t574989\t7.825\n" +
+  "chr7\tchr15\t>=20\t243\t6.984\n" +
+  "chr7\tchr16\t10-20\t36262\t6.206\n" +
+  "chr7\tchr16\t2-3\t6791861\t20.360\n" +
+  "chr7\tchr16\t3-5\t3683636\t16.960\n" +
+  "chr7\tchr16\t5-10\t644257\t7.819\n" +
+  "chr7\tchr16\t>=20\t270\t7.041\n" +
+  "chr7\tchr17\t10-20\t30924\t6.122\n" +
+  "chr7\tchr17\t2-3\t6445527\t20.606\n" +
+  "chr7\tchr17\t3-5\t3396915\t16.828\n" +
+  "chr7\tchr17\t5-10\t584261\t7.788\n" +
+  "chr7\tchr17\t>=20\t206\t6.990\n" +
+  "chr7\tchr18\t10-20\t29933\t6.092\n" +
+  "chr7\tchr18\t2-3\t6199308\t21.010\n" +
+  "chr7\tchr18\t3-5\t3134434\t16.545\n" +
+  "chr7\tchr18\t5-10\t543136\t7.699\n" +
+  "chr7\tchr18\t>=20\t181\t6.840\n" +
+  "chr7\tchr19\t10-20\t29828\t6.124\n" +
+  "chr7\tchr19\t2-3\t5787166\t19.462\n" +
+  "chr7\tchr19\t3-5\t3038006\t16.286\n" +
+  "chr7\tchr19\t5-10\t536142\t7.689\n" +
+  "chr7\tchr19\t>=20\t218\t7.188\n" +
+  "chr7\tchr20\t10-20\t30143\t6.100\n" +
+  "chr7\tchr20\t2-3\t5858688\t20.242\n" +
+  "chr7\tchr20\t3-5\t3112837\t16.382\n" +
+  "chr7\tchr20\t5-10\t550418\t7.717\n" +
+  "chr7\tchr20\t>=20\t208\t7.014\n" +
+  "chr7\tchr21\t10-20\t14980\t6.144\n" +
+  "chr7\tchr21\t2-3\t2931726\t20.869\n" +
+  "chr7\tchr21\t3-5\t1506302\t16.543\n" +
+  "chr7\tchr21\t5-10\t270744\t7.722\n" +
+  "chr7\tchr21\t>=20\t114\t7.272\n" +
+  "chr7\tchr22\t10-20\t18816\t6.202\n" +
+  "chr7\tchr22\t2-3\t3761782\t20.714\n" +
+  "chr7\tchr22\t3-5\t1962167\t16.978\n" +
+  "chr7\tchr22\t5-10\t344340\t7.817\n" +
+  "chr7\tchr22\t>=20\t163\t7.405\n" +
+  "chr8\tchr8\t10-20\t22759\t6.979\n" +
+  "chr8\tchr8\t2-3\t4518600\t22.380\n" +
+  "chr8\tchr8\t3-5\t2395513\t17.571\n" +
+  "chr8\tchr8\t5-10\t405729\t8.099\n" +
+  "chr8\tchr8\t>=20\t644\t15.349\n" +
+  "chr8\tchr9\t10-20\t40714\t6.110\n" +
+  "chr8\tchr9\t2-3\t8457104\t21.473\n" +
+  "chr8\tchr9\t3-5\t4490387\t17.135\n" +
+  "chr8\tchr9\t5-10\t766688\t7.758\n" +
+  "chr8\tchr9\t>=20\t241\t6.971\n" +
+  "chr8\tchr10\t10-20\t36842\t6.174\n" +
+  "chr8\tchr10\t2-3\t8507044\t21.619\n" +
+  "chr8\tchr10\t3-5\t4256694\t16.789\n" +
+  "chr8\tchr10\t5-10\t705606\t7.756\n" +
+  "chr8\tchr10\t>=20\t201\t6.950\n" +
+  "chr8\tchr11\t10-20\t36808\t6.178\n" +
+  "chr8\tchr11\t2-3\t7857565\t21.427\n" +
+  "chr8\tchr11\t3-5\t4126265\t16.848\n" +
+  "chr8\tchr11\t5-10\t709600\t7.808\n" +
+  "chr8\tchr11\t>=20\t232\t6.905\n" +
+  "chr8\tchr12\t10-20\t37606\t6.133\n" +
+  "chr8\tchr12\t2-3\t8618018\t21.792\n" +
+  "chr8\tchr12\t3-5\t4312194\t16.988\n" +
+  "chr8\tchr12\t5-10\t714979\t7.786\n" +
+  "chr8\tchr12\t>=20\t187\t6.989\n" +
+  "chr8\tchr13\t10-20\t25915\t6.084\n" +
+  "chr8\tchr13\t2-3\t5793070\t21.267\n" +
+  "chr8\tchr13\t3-5\t2852760\t16.328\n" +
+  "chr8\tchr13\t5-10\t486302\t7.692\n" +
+  "chr8\tchr13\t>=20\t128\t6.648\n" +
+  "chr8\tchr14\t10-20\t27193\t6.183\n" +
+  "chr8\tchr14\t2-3\t5739002\t21.582\n" +
+  "chr8\tchr14\t3-5\t2947746\t17.005\n" +
+  "chr8\tchr14\t5-10\t497325\t7.839\n" +
+  "chr8\tchr14\t>=20\t189\t6.974\n" +
+  "chr8\tchr15\t10-20\t27738\t6.174\n" +
+  "chr8\tchr15\t2-3\t5726728\t21.627\n" +
+  "chr8\tchr15\t3-5\t3046271\t17.048\n" +
+  "chr8\tchr15\t5-10\t522474\t7.805\n" +
+  "chr8\tchr15\t>=20\t176\t7.097\n" +
+  "chr8\tchr16\t10-20\t31754\t6.206\n" +
+  "chr8\tchr16\t2-3\t6246654\t20.879\n" +
+  "chr8\tchr16\t3-5\t3410926\t17.159\n" +
+  "chr8\tchr16\t5-10\t584294\t7.822\n" +
+  "chr8\tchr16\t>=20\t199\t6.985\n" +
+  "chr8\tchr17\t10-20\t27551\t6.115\n" +
+  "chr8\tchr17\t2-3\t5908745\t21.119\n" +
+  "chr8\tchr17\t3-5\t3137925\t17.023\n" +
+  "chr8\tchr17\t5-10\t529142\t7.789\n" +
+  "chr8\tchr17\t>=20\t156\t6.814\n" +
+  "chr8\tchr18\t10-20\t26193\t6.104\n" +
+  "chr8\tchr18\t2-3\t5689234\t21.491\n" +
+  "chr8\tchr18\t3-5\t2897820\t16.717\n" +
+  "chr8\tchr18\t5-10\t491588\t7.700\n" +
+  "chr8\tchr18\t>=20\t144\t6.868\n" +
+  "chr8\tchr19\t10-20\t26330\t6.113\n" +
+  "chr8\tchr19\t2-3\t5303072\t19.901\n" +
+  "chr8\tchr19\t3-5\t2801105\t16.430\n" +
+  "chr8\tchr19\t5-10\t481942\t7.689\n" +
+  "chr8\tchr19\t>=20\t159\t7.050\n" +
+  "chr8\tchr20\t10-20\t26355\t6.125\n" +
+  "chr8\tchr20\t2-3\t5386804\t20.710\n" +
+  "chr8\tchr20\t3-5\t2874765\t16.514\n" +
+  "chr8\tchr20\t5-10\t498522\t7.716\n" +
+  "chr8\tchr20\t>=20\t152\t6.862\n" +
+  "chr8\tchr21\t10-20\t13275\t6.144\n" +
+  "chr8\tchr21\t2-3\t2692091\t21.387\n" +
+  "chr8\tchr21\t3-5\t1393504\t16.737\n" +
+  "chr8\tchr21\t5-10\t243668\t7.730\n" +
+  "chr8\tchr21\t>=20\t79\t6.937\n" +
+  "chr8\tchr22\t10-20\t16678\t6.174\n" +
+  "chr8\tchr22\t2-3\t3452844\t21.194\n" +
+  "chr8\tchr22\t3-5\t1811596\t17.164\n" +
+  "chr8\tchr22\t5-10\t311039\t7.814\n" +
+  "chr8\tchr22\t>=20\t102\t6.696\n" +
+  "chr9\tchr9\t10-20\t23324\t6.922\n" +
+  "chr9\tchr9\t2-3\t4009518\t20.965\n" +
+  "chr9\tchr9\t3-5\t2171270\t17.180\n" +
+  "chr9\tchr9\t5-10\t392258\t8.034\n" +
+  "chr9\tchr9\t>=20\t658\t15.305\n" +
+  "chr9\tchr10\t10-20\t37530\t6.149\n" +
+  "chr9\tchr10\t2-3\t8035370\t20.982\n" +
+  "chr9\tchr10\t3-5\t4066707\t16.626\n" +
+  "chr9\tchr10\t5-10\t696592\t7.724\n" +
+  "chr9\tchr10\t>=20\t191\t7.068\n" +
+  "chr9\tchr11\t10-20\t37571\t6.168\n" +
+  "chr9\tchr11\t2-3\t7403443\t20.804\n" +
+  "chr9\tchr11\t3-5\t3935016\t16.682\n" +
+  "chr9\tchr11\t5-10\t697328\t7.783\n" +
+  "chr9\tchr11\t>=20\t211\t7.009\n" +
+  "chr9\tchr12\t10-20\t38513\t6.124\n" +
+  "chr9\tchr12\t2-3\t8151549\t21.162\n" +
+  "chr9\tchr12\t3-5\t4132456\t16.824\n" +
+  "chr9\tchr12\t5-10\t707810\t7.757\n" +
+  "chr9\tchr12\t>=20\t187\t7.091\n" +
+  "chr9\tchr13\t10-20\t26592\t6.074\n" +
+  "chr9\tchr13\t2-3\t5469504\t20.675\n" +
+  "chr9\tchr13\t3-5\t2726407\t16.201\n" +
+  "chr9\tchr13\t5-10\t477782\t7.654\n" +
+  "chr9\tchr13\t>=20\t167\t6.790\n" +
+  "chr9\tchr14\t10-20\t28051\t6.194\n" +
+  "chr9\tchr14\t2-3\t5418399\t20.958\n" +
+  "chr9\tchr14\t3-5\t2814777\t16.812\n" +
+  "chr9\tchr14\t5-10\t489829\t7.801\n" +
+  "chr9\tchr14\t>=20\t146\t6.870\n" +
+  "chr9\tchr15\t10-20\t28398\t6.173\n" +
+  "chr9\tchr15\t2-3\t5396634\t20.959\n" +
+  "chr9\tchr15\t3-5\t2907348\t16.896\n" +
+  "chr9\tchr15\t5-10\t515378\t7.785\n" +
+  "chr9\tchr15\t>=20\t175\t7.177\n" +
+  "chr9\tchr16\t10-20\t32760\t6.190\n" +
+  "chr9\tchr16\t2-3\t5879472\t20.214\n" +
+  "chr9\tchr16\t3-5\t3248248\t16.982\n" +
+  "chr9\tchr16\t5-10\t575879\t7.783\n" +
+  "chr9\tchr16\t>=20\t199\t7.030\n" +
+  "chr9\tchr17\t10-20\t28242\t6.089\n" +
+  "chr9\tchr17\t2-3\t5577463\t20.471\n" +
+  "chr9\tchr17\t3-5\t2995815\t16.841\n" +
+  "chr9\tchr17\t5-10\t520242\t7.755\n" +
+  "chr9\tchr17\t>=20\t145\t6.772\n" +
+  "chr9\tchr18\t10-20\t26692\t6.078\n" +
+  "chr9\tchr18\t2-3\t5366861\t20.901\n" +
+  "chr9\tchr18\t3-5\t2766546\t16.564\n" +
+  "chr9\tchr18\t5-10\t483344\t7.680\n" +
+  "chr9\tchr18\t>=20\t140\t6.807\n" +
+  "chr9\tchr19\t10-20\t26580\t6.095\n" +
+  "chr9\tchr19\t2-3\t5002472\t19.324\n" +
+  "chr9\tchr19\t3-5\t2676672\t16.291\n" +
+  "chr9\tchr19\t5-10\t477110\t7.678\n" +
+  "chr9\tchr19\t>=20\t136\t7.250\n" +
+  "chr9\tchr20\t10-20\t27260\t6.094\n" +
+  "chr9\tchr20\t2-3\t5069236\t20.085\n" +
+  "chr9\tchr20\t3-5\t2737938\t16.354\n" +
+  "chr9\tchr20\t5-10\t490030\t7.692\n" +
+  "chr9\tchr20\t>=20\t152\t7.178\n" +
+  "chr9\tchr21\t10-20\t13424\t6.124\n" +
+  "chr9\tchr21\t2-3\t2541457\t20.733\n" +
+  "chr9\tchr21\t3-5\t1327596\t16.538\n" +
+  "chr9\tchr21\t5-10\t240010\t7.696\n" +
+  "chr9\tchr21\t>=20\t74\t6.838\n" +
+  "chr9\tchr22\t10-20\t16830\t6.180\n" +
+  "chr9\tchr22\t2-3\t3257321\t20.555\n" +
+  "chr9\tchr22\t3-5\t1727664\t16.952\n" +
+  "chr9\tchr22\t5-10\t306069\t7.772\n" +
+  "chr9\tchr22\t>=20\t118\t7.051\n" +
+  "chr10\tchr10\t10-20\t19556\t7.048\n" +
+  "chr10\tchr10\t2-3\t4058112\t21.311\n" +
+  "chr10\tchr10\t3-5\t1961533\t16.540\n" +
+  "chr10\tchr10\t5-10\t335369\t8.069\n" +
+  "chr10\tchr10\t>=20\t508\t15.726\n" +
+  "chr10\tchr11\t10-20\t34179\t6.212\n" +
+  "chr10\tchr11\t2-3\t7459572\t20.931\n" +
+  "chr10\tchr11\t3-5\t3743291\t16.332\n" +
+  "chr10\tchr11\t5-10\t645572\t7.779\n" +
+  "chr10\tchr11\t>=20\t188\t7.431\n" +
+  "chr10\tchr12\t10-20\t35397\t6.167\n" +
+  "chr10\tchr12\t2-3\t8197830\t21.266\n" +
+  "chr10\tchr12\t3-5\t3920347\t16.477\n" +
+  "chr10\tchr12\t5-10\t653408\t7.758\n" +
+  "chr10\tchr12\t>=20\t202\t7.069\n" +
+  "chr10\tchr13\t10-20\t24256\t6.132\n" +
+  "chr10\tchr13\t2-3\t5501644\t20.758\n" +
+  "chr10\tchr13\t3-5\t2593052\t15.864\n" +
+  "chr10\tchr13\t5-10\t440804\t7.656\n" +
+  "chr10\tchr13\t>=20\t150\t6.920\n" +
+  "chr10\tchr14\t10-20\t25365\t6.233\n" +
+  "chr10\tchr14\t2-3\t5457073\t21.101\n" +
+  "chr10\tchr14\t3-5\t2677465\t16.463\n" +
+  "chr10\tchr14\t5-10\t454489\t7.818\n" +
+  "chr10\tchr14\t>=20\t175\t6.869\n" +
+  "chr10\tchr15\t10-20\t25408\t6.250\n" +
+  "chr10\tchr15\t2-3\t5447316\t21.085\n" +
+  "chr10\tchr15\t3-5\t2763335\t16.518\n" +
+  "chr10\tchr15\t5-10\t473395\t7.780\n" +
+  "chr10\tchr15\t>=20\t150\t6.900\n" +
+  "chr10\tchr16\t10-20\t29260\t6.267\n" +
+  "chr10\tchr16\t2-3\t5942987\t20.411\n" +
+  "chr10\tchr16\t3-5\t3089828\t16.624\n" +
+  "chr10\tchr16\t5-10\t530377\t7.788\n" +
+  "chr10\tchr16\t>=20\t170\t7.271\n" +
+  "chr10\tchr17\t10-20\t25394\t6.144\n" +
+  "chr10\tchr17\t2-3\t5628445\t20.617\n" +
+  "chr10\tchr17\t3-5\t2843647\t16.483\n" +
+  "chr10\tchr17\t5-10\t481221\t7.744\n" +
+  "chr10\tchr17\t>=20\t156\t6.994\n" +
+  "chr10\tchr18\t10-20\t23745\t6.141\n" +
+  "chr10\tchr18\t2-3\t5407523\t20.983\n" +
+  "chr10\tchr18\t3-5\t2624888\t16.196\n" +
+  "chr10\tchr18\t5-10\t446932\t7.676\n" +
+  "chr10\tchr18\t>=20\t137\t7.044\n" +
+  "chr10\tchr19\t10-20\t24345\t6.152\n" +
+  "chr10\tchr19\t2-3\t5067818\t19.481\n" +
+  "chr10\tchr19\t3-5\t2548422\t15.929\n" +
+  "chr10\tchr19\t5-10\t440963\t7.654\n" +
+  "chr10\tchr19\t>=20\t127\t7.031\n" +
+  "chr10\tchr20\t10-20\t24517\t6.141\n" +
+  "chr10\tchr20\t2-3\t5120691\t20.243\n" +
+  "chr10\tchr20\t3-5\t2599846\t16.003\n" +
+  "chr10\tchr20\t5-10\t451036\t7.681\n" +
+  "chr10\tchr20\t>=20\t160\t7.075\n" +
+  "chr10\tchr21\t10-20\t12401\t6.224\n" +
+  "chr10\tchr21\t2-3\t2560093\t20.857\n" +
+  "chr10\tchr21\t3-5\t1264588\t16.181\n" +
+  "chr10\tchr21\t5-10\t221928\t7.700\n" +
+  "chr10\tchr21\t>=20\t93\t7.462\n" +
+  "chr10\tchr22\t10-20\t15497\t6.242\n" +
+  "chr10\tchr22\t2-3\t3284635\t20.736\n" +
+  "chr10\tchr22\t3-5\t1647609\t16.657\n" +
+  "chr10\tchr22\t5-10\t284259\t7.782\n" +
+  "chr10\tchr22\t>=20\t87\t6.966\n" +
+  "chr11\tchr11\t10-20\t19929\t7.182\n" +
+  "chr11\tchr11\t2-3\t3465235\t20.989\n" +
+  "chr11\tchr11\t3-5\t1835425\t16.560\n" +
+  "chr11\tchr11\t5-10\t335105\t8.132\n" +
+  "chr11\tchr11\t>=20\t511\t14.587\n" +
+  "chr11\tchr12\t10-20\t35519\t6.177\n" +
+  "chr11\tchr12\t2-3\t7574656\t21.126\n" +
+  "chr11\tchr12\t3-5\t3798582\t16.536\n" +
+  "chr11\tchr12\t5-10\t657725\t7.819\n" +
+  "chr11\tchr12\t>=20\t204\t7.029\n" +
+  "chr11\tchr13\t10-20\t24112\t6.133\n" +
+  "chr11\tchr13\t2-3\t5088603\t20.602\n" +
+  "chr11\tchr13\t3-5\t2505868\t15.905\n" +
+  "chr11\tchr13\t5-10\t443295\t7.711\n" +
+  "chr11\tchr13\t>=20\t161\t6.789\n" +
+  "chr11\tchr14\t10-20\t25495\t6.237\n" +
+  "chr11\tchr14\t2-3\t5040311\t20.914\n" +
+  "chr11\tchr14\t3-5\t2587173\t16.546\n" +
+  "chr11\tchr14\t5-10\t455487\t7.862\n" +
+  "chr11\tchr14\t>=20\t178\t6.972\n" +
+  "chr11\tchr15\t10-20\t25660\t6.226\n" +
+  "chr11\tchr15\t2-3\t5014067\t20.931\n" +
+  "chr11\tchr15\t3-5\t2669611\t16.556\n" +
+  "chr11\tchr15\t5-10\t475367\t7.827\n" +
+  "chr11\tchr15\t>=20\t167\t7.263\n" +
+  "chr11\tchr16\t10-20\t29691\t6.258\n" +
+  "chr11\tchr16\t2-3\t5467205\t20.230\n" +
+  "chr11\tchr16\t3-5\t2987489\t16.669\n" +
+  "chr11\tchr16\t5-10\t532785\t7.836\n" +
+  "chr11\tchr16\t>=20\t192\t7.167\n" +
+  "chr11\tchr17\t10-20\t25733\t6.148\n" +
+  "chr11\tchr17\t2-3\t5188451\t20.440\n" +
+  "chr11\tchr17\t3-5\t2755478\t16.538\n" +
+  "chr11\tchr17\t5-10\t483150\t7.810\n" +
+  "chr11\tchr17\t>=20\t155\t7.000\n" +
+  "chr11\tchr18\t10-20\t24266\t6.150\n" +
+  "chr11\tchr18\t2-3\t4988886\t20.831\n" +
+  "chr11\tchr18\t3-5\t2544558\t16.268\n" +
+  "chr11\tchr18\t5-10\t448376\t7.734\n" +
+  "chr11\tchr18\t>=20\t136\t6.882\n" +
+  "chr11\tchr19\t10-20\t24726\t6.186\n" +
+  "chr11\tchr19\t2-3\t4659983\t19.315\n" +
+  "chr11\tchr19\t3-5\t2463690\t15.997\n" +
+  "chr11\tchr19\t5-10\t441427\t7.718\n" +
+  "chr11\tchr19\t>=20\t144\t7.014\n" +
+  "chr11\tchr20\t10-20\t24776\t6.121\n" +
+  "chr11\tchr20\t2-3\t4710921\t20.082\n" +
+  "chr11\tchr20\t3-5\t2522975\t16.077\n" +
+  "chr11\tchr20\t5-10\t452802\t7.734\n" +
+  "chr11\tchr20\t>=20\t138\t7.109\n" +
+  "chr11\tchr21\t10-20\t12347\t6.175\n" +
+  "chr11\tchr21\t2-3\t2360261\t20.692\n" +
+  "chr11\tchr21\t3-5\t1220070\t16.243\n" +
+  "chr11\tchr21\t5-10\t222495\t7.740\n" +
+  "chr11\tchr21\t>=20\t87\t7.299\n" +
+  "chr11\tchr22\t10-20\t15451\t6.246\n" +
+  "chr11\tchr22\t2-3\t3031915\t20.559\n" +
+  "chr11\tchr22\t3-5\t1592144\t16.679\n" +
+  "chr11\tchr22\t5-10\t285097\t7.832\n" +
+  "chr11\tchr22\t>=20\t95\t7.284\n" +
+  "chr12\tchr12\t10-20\t20554\t7.026\n" +
+  "chr12\tchr12\t2-3\t4193048\t21.666\n" +
+  "chr12\tchr12\t3-5\t2020707\t16.859\n" +
+  "chr12\tchr12\t5-10\t346713\t8.141\n" +
+  "chr12\tchr12\t>=20\t508\t15.382\n" +
+  "chr12\tchr13\t10-20\t24634\t6.130\n" +
+  "chr12\tchr13\t2-3\t5594354\t20.922\n" +
+  "chr12\tchr13\t3-5\t2631955\t16.006\n" +
+  "chr12\tchr13\t5-10\t450284\t7.675\n" +
+  "chr12\tchr13\t>=20\t151\t7.060\n" +
+  "chr12\tchr14\t10-20\t26025\t6.224\n" +
+  "chr12\tchr14\t2-3\t5543726\t21.294\n" +
+  "chr12\tchr14\t3-5\t2723368\t16.691\n" +
+  "chr12\tchr14\t5-10\t463578\t7.849\n" +
+  "chr12\tchr14\t>=20\t207\t6.783\n" +
+  "chr12\tchr15\t10-20\t26224\t6.190\n" +
+  "chr12\tchr15\t2-3\t5527032\t21.292\n" +
+  "chr12\tchr15\t3-5\t2806025\t16.698\n" +
+  "chr12\tchr15\t5-10\t483670\t7.817\n" +
+  "chr12\tchr15\t>=20\t160\t7.225\n" +
+  "chr12\tchr16\t10-20\t29777\t6.201\n" +
+  "chr12\tchr16\t2-3\t6022479\t20.581\n" +
+  "chr12\tchr16\t3-5\t3128015\t16.800\n" +
+  "chr12\tchr16\t5-10\t539290\t7.817\n" +
+  "chr12\tchr16\t>=20\t196\t6.918\n" +
+  "chr12\tchr17\t10-20\t26330\t6.119\n" +
+  "chr12\tchr17\t2-3\t5712321\t20.805\n" +
+  "chr12\tchr17\t3-5\t2888863\t16.645\n" +
+  "chr12\tchr17\t5-10\t489183\t7.777\n" +
+  "chr12\tchr17\t>=20\t178\t6.826\n" +
+  "chr12\tchr18\t10-20\t24544\t6.099\n" +
+  "chr12\tchr18\t2-3\t5482308\t21.183\n" +
+  "chr12\tchr18\t3-5\t2674610\t16.399\n" +
+  "chr12\tchr18\t5-10\t455593\t7.697\n" +
+  "chr12\tchr18\t>=20\t144\t6.917\n" +
+  "chr12\tchr19\t10-20\t25217\t6.133\n" +
+  "chr12\tchr19\t2-3\t5143548\t19.666\n" +
+  "chr12\tchr19\t3-5\t2596341\t16.118\n" +
+  "chr12\tchr19\t5-10\t451637\t7.688\n" +
+  "chr12\tchr19\t>=20\t137\t6.971\n" +
+  "chr12\tchr20\t10-20\t25104\t6.105\n" +
+  "chr12\tchr20\t2-3\t5196393\t20.428\n" +
+  "chr12\tchr20\t3-5\t2647011\t16.217\n" +
+  "chr12\tchr20\t5-10\t460293\t7.721\n" +
+  "chr12\tchr20\t>=20\t168\t6.827\n" +
+  "chr12\tchr21\t10-20\t12603\t6.127\n" +
+  "chr12\tchr21\t2-3\t2595285\t21.005\n" +
+  "chr12\tchr21\t3-5\t1280739\t16.369\n" +
+  "chr12\tchr21\t5-10\t225284\t7.724\n" +
+  "chr12\tchr21\t>=20\t69\t7.087\n" +
+  "chr12\tchr22\t10-20\t16110\t6.171\n" +
+  "chr12\tchr22\t2-3\t3331657\t20.931\n" +
+  "chr12\tchr22\t3-5\t1669320\t16.809\n" +
+  "chr12\tchr22\t5-10\t287554\t7.807\n" +
+  "chr12\tchr22\t>=20\t105\t6.838\n" +
+  "chr13\tchr13\t10-20\t10060\t6.960\n" +
+  "chr13\tchr13\t2-3\t1889376\t20.634\n" +
+  "chr13\tchr13\t3-5\t886703\t15.686\n" +
+  "chr13\tchr13\t5-10\t159586\t7.940\n" +
+  "chr13\tchr13\t>=20\t357\t14.238\n" +
+  "chr13\tchr14\t10-20\t17799\t6.137\n" +
+  "chr13\tchr14\t2-3\t3723038\t20.764\n" +
+  "chr13\tchr14\t3-5\t1796063\t16.029\n" +
+  "chr13\tchr14\t5-10\t311345\t7.737\n" +
+  "chr13\tchr14\t>=20\t119\t6.807\n" +
+  "chr13\tchr15\t10-20\t18195\t6.136\n" +
+  "chr13\tchr15\t2-3\t3707498\t20.775\n" +
+  "chr13\tchr15\t3-5\t1855117\t16.055\n" +
+  "chr13\tchr15\t5-10\t326963\t7.713\n" +
+  "chr13\tchr15\t>=20\t118\t7.136\n" +
+  "chr13\tchr16\t10-20\t20656\t6.171\n" +
+  "chr13\tchr16\t2-3\t4047003\t20.137\n" +
+  "chr13\tchr16\t3-5\t2069540\t16.184\n" +
+  "chr13\tchr16\t5-10\t364867\t7.703\n" +
+  "chr13\tchr16\t>=20\t103\t6.874\n" +
+  "chr13\tchr17\t10-20\t18058\t6.080\n" +
+  "chr13\tchr17\t2-3\t3834820\t20.327\n" +
+  "chr13\tchr17\t3-5\t1908443\t16.028\n" +
+  "chr13\tchr17\t5-10\t330642\t7.681\n" +
+  "chr13\tchr17\t>=20\t105\t7.000\n" +
+  "chr13\tchr18\t10-20\t17074\t6.047\n" +
+  "chr13\tchr18\t2-3\t3682692\t20.648\n" +
+  "chr13\tchr18\t3-5\t1760669\t15.760\n" +
+  "chr13\tchr18\t5-10\t307343\t7.606\n" +
+  "chr13\tchr18\t>=20\t105\t6.943\n" +
+  "chr13\tchr19\t10-20\t17387\t6.084\n" +
+  "chr13\tchr19\t2-3\t3452664\t19.245\n" +
+  "chr13\tchr19\t3-5\t1713289\t15.518\n" +
+  "chr13\tchr19\t5-10\t303793\t7.588\n" +
+  "chr13\tchr19\t>=20\t103\t7.087\n" +
+  "chr13\tchr20\t10-20\t17371\t6.069\n" +
+  "chr13\tchr20\t2-3\t3487625\t19.981\n" +
+  "chr13\tchr20\t3-5\t1745402\t15.574\n" +
+  "chr13\tchr20\t5-10\t310549\t7.605\n" +
+  "chr13\tchr20\t>=20\t113\t6.858\n" +
+  "chr13\tchr21\t10-20\t8657\t6.083\n" +
+  "chr13\tchr21\t2-3\t1743414\t20.544\n" +
+  "chr13\tchr21\t3-5\t848055\t15.795\n" +
+  "chr13\tchr21\t5-10\t152694\t7.613\n" +
+  "chr13\tchr21\t>=20\t70\t6.986\n" +
+  "chr13\tchr22\t10-20\t10771\t6.166\n" +
+  "chr13\tchr22\t2-3\t2241043\t20.420\n" +
+  "chr13\tchr22\t3-5\t1099868\t16.177\n" +
+  "chr13\tchr22\t5-10\t194016\t7.702\n" +
+  "chr13\tchr22\t>=20\t67\t6.955\n" +
+  "chr14\tchr14\t10-20\t11440\t7.481\n" +
+  "chr14\tchr14\t2-3\t1858036\t21.362\n" +
+  "chr14\tchr14\t3-5\t944678\t16.971\n" +
+  "chr14\tchr14\t5-10\t170342\t8.362\n" +
+  "chr14\tchr14\t>=20\t383\t16.013\n" +
+  "chr14\tchr15\t10-20\t19016\t6.287\n" +
+  "chr14\tchr15\t2-3\t3678169\t21.077\n" +
+  "chr14\tchr15\t3-5\t1916749\t16.757\n" +
+  "chr14\tchr15\t5-10\t337487\t7.892\n" +
+  "chr14\tchr15\t>=20\t142\t6.951\n" +
+  "chr14\tchr16\t10-20\t21926\t6.320\n" +
+  "chr14\tchr16\t2-3\t4002096\t20.375\n" +
+  "chr14\tchr16\t3-5\t2134716\t16.827\n" +
+  "chr14\tchr16\t5-10\t375894\t7.886\n" +
+  "chr14\tchr16\t>=20\t138\t6.746\n" +
+  "chr14\tchr17\t10-20\t18895\t6.184\n" +
+  "chr14\tchr17\t2-3\t3798871\t20.586\n" +
+  "chr14\tchr17\t3-5\t1969476\t16.656\n" +
+  "chr14\tchr17\t5-10\t339953\t7.845\n" +
+  "chr14\tchr17\t>=20\t125\t6.800\n" +
+  "chr14\tchr18\t10-20\t18094\t6.169\n" +
+  "chr14\tchr18\t2-3\t3653731\t20.978\n" +
+  "chr14\tchr18\t3-5\t1821946\t16.430\n" +
+  "chr14\tchr18\t5-10\t316621\t7.760\n" +
+  "chr14\tchr18\t>=20\t133\t7.000\n" +
+  "chr14\tchr19\t10-20\t18013\t6.206\n" +
+  "chr14\tchr19\t2-3\t3416905\t19.480\n" +
+  "chr14\tchr19\t3-5\t1769071\t16.136\n" +
+  "chr14\tchr19\t5-10\t313476\t7.741\n" +
+  "chr14\tchr19\t>=20\t111\t6.919\n" +
+  "chr14\tchr20\t10-20\t18472\t6.171\n" +
+  "chr14\tchr20\t2-3\t3449733\t20.227\n" +
+  "chr14\tchr20\t3-5\t1802402\t16.232\n" +
+  "chr14\tchr20\t5-10\t320457\t7.769\n" +
+  "chr14\tchr20\t>=20\t114\t6.702\n" +
+  "chr14\tchr21\t10-20\t9069\t6.189\n" +
+  "chr14\tchr21\t2-3\t1727028\t20.812\n" +
+  "chr14\tchr21\t3-5\t872860\t16.343\n" +
+  "chr14\tchr21\t5-10\t156191\t7.781\n" +
+  "chr14\tchr21\t>=20\t53\t7.057\n" +
+  "chr14\tchr22\t10-20\t11599\t6.270\n" +
+  "chr14\tchr22\t2-3\t2216396\t20.720\n" +
+  "chr14\tchr22\t3-5\t1137023\t16.826\n" +
+  "chr14\tchr22\t5-10\t199601\t7.875\n" +
+  "chr14\tchr22\t>=20\t70\t7.029\n" +
+  "chr15\tchr15\t10-20\t11513\t7.102\n" +
+  "chr15\tchr15\t2-3\t1843071\t21.377\n" +
+  "chr15\tchr15\t3-5\t1005663\t17.035\n" +
+  "chr15\tchr15\t5-10\t184219\t8.217\n" +
+  "chr15\tchr15\t>=20\t371\t14.358\n" +
+  "chr15\tchr16\t10-20\t22305\t6.258\n" +
+  "chr15\tchr16\t2-3\t3984694\t20.359\n" +
+  "chr15\tchr16\t3-5\t2204486\t16.844\n" +
+  "chr15\tchr16\t5-10\t392932\t7.835\n" +
+  "chr15\tchr16\t>=20\t153\t7.020\n" +
+  "chr15\tchr17\t10-20\t19349\t6.146\n" +
+  "chr15\tchr17\t2-3\t3774165\t20.588\n" +
+  "chr15\tchr17\t3-5\t2033008\t16.707\n" +
+  "chr15\tchr17\t5-10\t355387\t7.808\n" +
+  "chr15\tchr17\t>=20\t124\t7.355\n" +
+  "chr15\tchr18\t10-20\t18171\t6.123\n" +
+  "chr15\tchr18\t2-3\t3637813\t20.991\n" +
+  "chr15\tchr18\t3-5\t1878060\t16.448\n" +
+  "chr15\tchr18\t5-10\t331025\t7.723\n" +
+  "chr15\tchr18\t>=20\t113\t7.354\n" +
+  "chr15\tchr19\t10-20\t18528\t6.172\n" +
+  "chr15\tchr19\t2-3\t3393792\t19.456\n" +
+  "chr15\tchr19\t3-5\t1819503\t16.171\n" +
+  "chr15\tchr19\t5-10\t325988\t7.719\n" +
+  "chr15\tchr19\t>=20\t121\t7.149\n" +
+  "chr15\tchr20\t10-20\t18290\t6.172\n" +
+  "chr15\tchr20\t2-3\t3433275\t20.249\n" +
+  "chr15\tchr20\t3-5\t1862513\t16.258\n" +
+  "chr15\tchr20\t5-10\t335258\t7.747\n" +
+  "chr15\tchr20\t>=20\t147\t6.816\n" +
+  "chr15\tchr21\t10-20\t9128\t6.189\n" +
+  "chr15\tchr21\t2-3\t1719873\t20.874\n" +
+  "chr15\tchr21\t3-5\t898911\t16.408\n" +
+  "chr15\tchr21\t5-10\t163948\t7.754\n" +
+  "chr15\tchr21\t>=20\t55\t7.000\n" +
+  "chr15\tchr22\t10-20\t11824\t6.308\n" +
+  "chr15\tchr22\t2-3\t2210224\t20.707\n" +
+  "chr15\tchr22\t3-5\t1172704\t16.826\n" +
+  "chr15\tchr22\t5-10\t208261\t7.826\n" +
+  "chr15\tchr22\t>=20\t98\t7.051\n" +
+  "chr16\tchr16\t10-20\t15174\t7.278\n" +
+  "chr16\tchr16\t2-3\t2186414\t19.827\n" +
+  "chr16\tchr16\t3-5\t1255523\t17.182\n" +
+  "chr16\tchr16\t5-10\t230874\t8.205\n" +
+  "chr16\tchr16\t>=20\t456\t15.213\n" +
+  "chr16\tchr17\t10-20\t22127\t6.162\n" +
+  "chr16\tchr17\t2-3\t4116242\t19.852\n" +
+  "chr16\tchr17\t3-5\t2271615\t16.824\n" +
+  "chr16\tchr17\t5-10\t396509\t7.814\n" +
+  "chr16\tchr17\t>=20\t130\t6.792\n" +
+  "chr16\tchr18\t10-20\t21112\t6.173\n" +
+  "chr16\tchr18\t2-3\t3966910\t20.306\n" +
+  "chr16\tchr18\t3-5\t2095994\t16.541\n" +
+  "chr16\tchr18\t5-10\t370771\t7.738\n" +
+  "chr16\tchr18\t>=20\t124\t7.194\n" +
+  "chr16\tchr19\t10-20\t21031\t6.182\n" +
+  "chr16\tchr19\t2-3\t3694073\t18.725\n" +
+  "chr16\tchr19\t3-5\t2032777\t16.256\n" +
+  "chr16\tchr19\t5-10\t364698\t7.716\n" +
+  "chr16\tchr19\t>=20\t146\t6.938\n" +
+  "chr16\tchr20\t10-20\t21004\t6.177\n" +
+  "chr16\tchr20\t2-3\t3736867\t19.494\n" +
+  "chr16\tchr20\t3-5\t2073622\t16.326\n" +
+  "chr16\tchr20\t5-10\t372749\t7.743\n" +
+  "chr16\tchr20\t>=20\t140\t6.936\n" +
+  "chr16\tchr21\t10-20\t10586\t6.226\n" +
+  "chr16\tchr21\t2-3\t1875267\t20.196\n" +
+  "chr16\tchr21\t3-5\t1011449\t16.552\n" +
+  "chr16\tchr21\t5-10\t184956\t7.764\n" +
+  "chr16\tchr21\t>=20\t59\t6.661\n" +
+  "chr16\tchr22\t10-20\t13205\t6.281\n" +
+  "chr16\tchr22\t2-3\t2410797\t19.931\n" +
+  "chr16\tchr22\t3-5\t1308426\t16.937\n" +
+  "chr16\tchr22\t5-10\t233548\t7.811\n" +
+  "chr16\tchr22\t>=20\t73\t7.014\n" +
+  "chr17\tchr17\t10-20\t11314\t7.072\n" +
+  "chr17\tchr17\t2-3\t1966349\t20.273\n" +
+  "chr17\tchr17\t3-5\t1064986\t16.893\n" +
+  "chr17\tchr17\t5-10\t188856\t8.120\n" +
+  "chr17\tchr17\t>=20\t374\t14.516\n" +
+  "chr17\tchr18\t10-20\t18371\t6.076\n" +
+  "chr17\tchr18\t2-3\t3762515\t20.520\n" +
+  "chr17\tchr18\t3-5\t1939145\t16.402\n" +
+  "chr17\tchr18\t5-10\t335423\t7.714\n" +
+  "chr17\tchr18\t>=20\t100\t7.030\n" +
+  "chr17\tchr19\t10-20\t18590\t6.110\n" +
+  "chr17\tchr19\t2-3\t3509119\t18.955\n" +
+  "chr17\tchr19\t3-5\t1878123\t16.120\n" +
+  "chr17\tchr19\t5-10\t331060\t7.690\n" +
+  "chr17\tchr19\t>=20\t100\t7.000\n" +
+  "chr17\tchr20\t10-20\t18382\t6.069\n" +
+  "chr17\tchr20\t2-3\t3549949\t19.750\n" +
+  "chr17\tchr20\t3-5\t1919892\t16.213\n" +
+  "chr17\tchr20\t5-10\t339693\t7.715\n" +
+  "chr17\tchr20\t>=20\t111\t6.676\n" +
+  "chr17\tchr21\t10-20\t8975\t6.147\n" +
+  "chr17\tchr21\t2-3\t1774611\t20.409\n" +
+  "chr17\tchr21\t3-5\t930163\t16.368\n" +
+  "chr17\tchr21\t5-10\t165660\t7.711\n" +
+  "chr17\tchr21\t>=20\t40\t6.650\n" +
+  "chr17\tchr22\t10-20\t11786\t6.162\n" +
+  "chr17\tchr22\t2-3\t2284772\t20.191\n" +
+  "chr17\tchr22\t3-5\t1212954\t16.820\n" +
+  "chr17\tchr22\t5-10\t212270\t7.802\n" +
+  "chr17\tchr22\t>=20\t74\t6.932\n" +
+  "chr18\tchr18\t10-20\t10387\t7.144\n" +
+  "chr18\tchr18\t2-3\t1822958\t21.186\n" +
+  "chr18\tchr18\t3-5\t915037\t16.463\n" +
+  "chr18\tchr18\t5-10\t165114\t8.033\n" +
+  "chr18\tchr18\t>=20\t383\t15.204\n" +
+  "chr18\tchr19\t10-20\t17173\t6.051\n" +
+  "chr18\tchr19\t2-3\t3378333\t19.413\n" +
+  "chr18\tchr19\t3-5\t1733245\t15.861\n" +
+  "chr18\tchr19\t5-10\t307671\t7.612\n" +
+  "chr18\tchr19\t>=20\t99\t7.121\n" +
+  "chr18\tchr20\t10-20\t17165\t6.069\n" +
+  "chr18\tchr20\t2-3\t3416379\t20.161\n" +
+  "chr18\tchr20\t3-5\t1769605\t15.962\n" +
+  "chr18\tchr20\t5-10\t314261\t7.627\n" +
+  "chr18\tchr20\t>=20\t114\t6.728\n" +
+  "chr18\tchr21\t10-20\t8605\t6.122\n" +
+  "chr18\tchr21\t2-3\t1710400\t20.755\n" +
+  "chr18\tchr21\t3-5\t857137\t16.115\n" +
+  "chr18\tchr21\t5-10\t155103\t7.637\n" +
+  "chr18\tchr21\t>=20\t44\t6.864\n" +
+  "chr18\tchr22\t10-20\t10863\t6.149\n" +
+  "chr18\tchr22\t2-3\t2197284\t20.606\n" +
+  "chr18\tchr22\t3-5\t1116546\t16.538\n" +
+  "chr18\tchr22\t5-10\t197042\t7.712\n" +
+  "chr18\tchr22\t>=20\t50\t7.280\n" +
+  "chr19\tchr19\t10-20\t10716\t7.088\n" +
+  "chr19\tchr19\t2-3\t1588666\t18.151\n" +
+  "chr19\tchr19\t3-5\t857778\t15.830\n" +
+  "chr19\tchr19\t5-10\t160259\t7.988\n" +
+  "chr19\tchr19\t>=20\t421\t15.283\n" +
+  "chr19\tchr20\t10-20\t17388\t6.086\n" +
+  "chr19\tchr20\t2-3\t3181947\t18.667\n" +
+  "chr19\tchr20\t3-5\t1716192\t15.712\n" +
+  "chr19\tchr20\t5-10\t310685\t7.622\n" +
+  "chr19\tchr20\t>=20\t112\t7.107\n" +
+  "chr19\tchr21\t10-20\t8843\t6.114\n" +
+  "chr19\tchr21\t2-3\t1595454\t19.296\n" +
+  "chr19\tchr21\t3-5\t833358\t15.885\n" +
+  "chr19\tchr21\t5-10\t153356\t7.632\n" +
+  "chr19\tchr21\t>=20\t53\t7.566\n" +
+  "chr19\tchr22\t10-20\t11042\t6.160\n" +
+  "chr19\tchr22\t2-3\t2057993\t19.084\n" +
+  "chr19\tchr22\t3-5\t1085660\t16.261\n" +
+  "chr19\tchr22\t5-10\t195217\t7.723\n" +
+  "chr19\tchr22\t>=20\t77\t7.169\n" +
+  "chr20\tchr20\t10-20\t10731\t7.363\n" +
+  "chr20\tchr20\t2-3\t1624148\t19.670\n" +
+  "chr20\tchr20\t3-5\t892658\t16.058\n" +
+  "chr20\tchr20\t5-10\t167934\t8.025\n" +
+  "chr20\tchr20\t>=20\t402\t16.201\n" +
+  "chr20\tchr21\t10-20\t8838\t6.117\n" +
+  "chr20\tchr21\t2-3\t1613167\t20.046\n" +
+  "chr20\tchr21\t3-5\t850827\t15.974\n" +
+  "chr20\tchr21\t5-10\t156406\t7.668\n" +
+  "chr20\tchr21\t>=20\t60\t6.933\n" +
+  "chr20\tchr22\t10-20\t11157\t6.189\n" +
+  "chr20\tchr22\t2-3\t2076486\t19.838\n" +
+  "chr20\tchr22\t3-5\t1108853\t16.352\n" +
+  "chr20\tchr22\t5-10\t199481\t7.735\n" +
+  "chr20\tchr22\t>=20\t83\t6.928\n" +
+  "chr21\tchr21\t10-20\t2914\t7.543\n" +
+  "chr21\tchr21\t2-3\t408688\t20.986\n" +
+  "chr21\tchr21\t3-5\t212270\t16.539\n" +
+  "chr21\tchr21\t5-10\t41815\t8.280\n" +
+  "chr21\tchr21\t>=20\t167\t15.772\n" +
+  "chr21\tchr22\t10-20\t5426\t6.236\n" +
+  "chr21\tchr22\t2-3\t1040106\t20.446\n" +
+  "chr21\tchr22\t3-5\t535936\t16.502\n" +
+  "chr21\tchr22\t5-10\t97203\t7.741\n" +
+  "chr21\tchr22\t>=20\t44\t7.705\n" +
+  "chr22\tchr22\t10-20\t4551\t7.964\n" +
+  "chr22\tchr22\t2-3\t674073\t20.729\n" +
+  "chr22\tchr22\t3-5\t358257\t17.336\n" +
+  "chr22\tchr22\t5-10\t67259\t8.492\n" +
+  "chr22\tchr22\t>=20\t226\t15.544\n" +
+  "";
+if (EMBEDDED_TSV) { try { load(EMBEDDED_TSV); } catch (x) { fail(x); } }
+else fetch(CFG.data).then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.text(); }).then(load).catch(fail);
+</script>
+</body>
+</html>
